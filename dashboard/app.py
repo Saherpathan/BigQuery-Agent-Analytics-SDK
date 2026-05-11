@@ -55,18 +55,17 @@ with st.sidebar:
 # --- 4. Data Connector ---
 @st.cache_resource
 def get_bq_client(p_id):
+    # Check if we are running in Streamlit Cloud with secrets
+    if "gcp_service_account" in st.secrets:
+        # Load credentials from secrets
+        creds_info = st.secrets["gcp_service_account"]
+        credentials = service_account.Credentials.from_service_account_info(creds_info)
+        return bigquery.Client(project=p_id, credentials=credentials)
+    
+    # Fallback to local ADC for local development
     return bigquery.Client(project=p_id)
 
 client = get_bq_client(project_id)
-
-def safe_query(sql, params=None):
-    try:
-        job_config = bigquery.QueryJobConfig(query_parameters=params) if params else None
-        formatted_sql = sql.replace("{table_ref}", table_ref)
-        return client.query(formatted_sql, job_config=job_config).to_dataframe()
-    except Exception as e:
-        st.error(f"Query Failed: {e}")
-        return pd.DataFrame()
 
 # --- 5. Global Params (Resolved 400 Parameter Error) ---
 
