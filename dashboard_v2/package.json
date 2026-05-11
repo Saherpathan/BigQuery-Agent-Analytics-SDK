@@ -8,7 +8,7 @@
     "dev": "vite --port=3000 --host=0.0.0.0",
     "lint": "tsc --noEmit",
     "preview": "vite preview",
-    "start": "node server.cjs"
+    "start": "vite preview --host=0.0.0.0"
   },
   "dependencies": {
     "@google-cloud/bigquery": "^8.3.0",

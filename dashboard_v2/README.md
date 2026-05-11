@@ -63,7 +63,7 @@ npm install
 Create a `.env` file in the root directory.
 
 ```env
-VITE_GCP_PROJECT_ID=your-project-id
+GCP_PROJECT_ID=your-project-id
 GOOGLE_APPLICATION_CREDENTIALS=./service-account.json
 ```
 
@@ -74,6 +74,16 @@ GCP_PROJECT_ID=your-project-id
 GCP_CLIENT_EMAIL=your-client-email
 GCP_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nYOUR_KEY\n-----END PRIVATE KEY-----\n"
 ```
+
+The API connector supports two authentication modes:
+
+- Local development: Application Default Credentials or
+  `GOOGLE_APPLICATION_CREDENTIALS`.
+- Vercel: `GCP_PROJECT_ID`, `GCP_CLIENT_EMAIL`, and `GCP_PRIVATE_KEY`.
+
+The Project / Dataset / Table fields in the dashboard identify the
+`agent_events` table to read. The service account still needs permission to
+run jobs in `GCP_PROJECT_ID` and read from the selected table.
 
 ---
 
@@ -117,17 +127,21 @@ Place it in the project root directory.
 
 # Running Locally
 
-Start the development server:
+Start the Vercel development server so the `/api` BigQuery connector runs
+alongside the Vite app:
 
 ```bash
-npm run dev
+npx vercel dev
 ```
 
 App will run on:
 
 ```bash
-http://localhost:5173
+http://localhost:3000
 ```
+
+`npm run dev` starts only Vite. Use it for UI-only work; BigQuery-backed
+dashboard data requires `npx vercel dev` or a deployed Vercel environment.
 
 ---
 
@@ -231,9 +245,14 @@ Use backend API routes inside `/api`.
 
 ## BigQuery Permission Denied
 
-Ensure service account has:
+Ensure the service account has:
 - BigQuery Data Viewer
 - BigQuery Job User
+
+If the dashboard returns "Missing Configuration", fill in Project ID, Dataset
+ID, and Table ID in the command bar. If it returns a BigQuery permissions
+error, confirm the service account can run query jobs in `GCP_PROJECT_ID` and
+read the selected table.
 
 ---
 
@@ -287,4 +306,3 @@ Server-side API routes for Vercel
 - Keep credentials server-side only
 
 ---
-

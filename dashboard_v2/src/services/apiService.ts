@@ -5,7 +5,7 @@ export const fetchAgentData = async (timespan: string = '24h') => {
     tableId: localStorage.getItem('user_bq_table') || '',
   };
 
-  const response = await fetch(`/api?timespan=${timespan}`, {
+  const response = await fetch(`/api?timespan=${encodeURIComponent(timespan)}`, {
     method: 'GET',
     headers: {
       'Content-Type': 'application/json',
