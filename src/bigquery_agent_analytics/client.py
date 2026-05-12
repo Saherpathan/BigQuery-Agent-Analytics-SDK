@@ -49,10 +49,14 @@ import concurrent.futures
 from datetime import datetime
 from datetime import timezone
 import logging
+import time
 from typing import Any, Optional
 
 from google.cloud import bigquery
 
+from ._telemetry import LabeledBigQueryClient
+from ._telemetry import make_bq_client
+from ._telemetry import with_sdk_labels
 from .categorical_evaluator import build_ai_classify_query
 from .categorical_evaluator import build_ai_generate_query
 from .categorical_evaluator import build_categorical_prompt
@@ -74,8 +78,10 @@ from .evaluators import DEFAULT_ENDPOINT
 from .evaluators import EvaluationReport
 from .evaluators import LLM_JUDGE_BATCH_QUERY
 from .evaluators import LLMAsJudge
+from .evaluators import render_ai_generate_judge_query
 from .evaluators import SESSION_SUMMARY_QUERY
 from .evaluators import SessionScore
+from .evaluators import split_judge_prompt_template
 from .feedback import AnalysisConfig
 from .feedback import compute_drift
 from .feedback import compute_question_distribution
@@ -134,9 +140,11 @@ ORDER BY timestamp ASC
 
 _LIST_TRACES_QUERY = """\
 WITH trace_sessions AS (
-  SELECT DISTINCT session_id
+  SELECT session_id
   FROM `{project}.{dataset}.{table}`
   WHERE {where}
+  GROUP BY session_id
+  ORDER BY MAX(timestamp) DESC, session_id
   LIMIT @trace_limit
 )
 SELECT
@@ -307,6 +315,12 @@ class Client:
           ``ML.GENERATE_TEXT`` instead.
       connection_id: Optional BigQuery connection resource ID
           for AI.GENERATE.
+      sdk_surface: Label value stamped on the ``sdk_surface``
+          dimension of every job this Client dispatches. Defaults to
+          ``"python"``. The CLI sets ``"cli"`` and the deployed
+          remote-function runtime sets ``"remote-function"``. Lets
+          operators attribute spend and usage back to the entry-point
+          surface in ``INFORMATION_SCHEMA.JOBS_BY_PROJECT``.
   """
 
   def __init__(
@@ -320,12 +334,15 @@ class Client:
       bq_client: Optional[bigquery.Client] = None,
       endpoint: Optional[str] = None,
       connection_id: Optional[str] = None,
+      sdk_surface: str = "python",
   ) -> None:
     self.project_id = project_id
     self.dataset_id = dataset_id
     self.location = location
     self.gcs_bucket_name = gcs_bucket_name
     self._bq_client = bq_client
+    self._warned_unlabeled_client = False
+    self._sdk_surface = sdk_surface
     self.endpoint = endpoint or DEFAULT_ENDPOINT
     self.connection_id = connection_id
 
@@ -341,12 +358,46 @@ class Client:
 
   @property
   def bq_client(self) -> bigquery.Client:
-    """Lazily initializes the BigQuery client."""
+    """Lazily initializes the BigQuery client.
+
+    When no ``bq_client`` is passed at construction time, builds a
+    ``LabeledBigQueryClient`` via ``make_bq_client`` so every job the
+    SDK submits carries the default SDK labels (``sdk``,
+    ``sdk_version``, ``sdk_surface``).
+
+    When the caller passes a vanilla ``bigquery.Client``, it is
+    honored **as-is** — we do not reconstruct it. Rebuilding from
+    ``project`` / ``credentials`` / ``location`` would silently drop
+    the caller's ``default_query_job_config`` (think
+    ``maximum_bytes_billed``, ``use_legacy_sql``, custom labels, write
+    disposition), ``default_load_job_config``, ``client_info``,
+    ``client_options``, any custom transport/session, and any subclass
+    overrides on ``query`` / ``load_table_from_json``. A one-shot
+    ``WARNING`` points callers to ``make_bq_client`` (or
+    ``LabeledBigQueryClient`` directly) if they also want SDK
+    telemetry labels.
+
+    Non-``bigquery.Client`` objects (e.g. ``MagicMock`` in tests) are
+    honored as-is, unchanged.
+    """
     if self._bq_client is None:
-      kwargs: dict = {"project": self.project_id}
-      if self.location:
-        kwargs["location"] = self.location
-      self._bq_client = bigquery.Client(**kwargs)
+      self._bq_client = make_bq_client(
+          self.project_id,
+          location=self.location,
+          sdk_surface=self._sdk_surface,
+      )
+    elif isinstance(self._bq_client, bigquery.Client) and not isinstance(
+        self._bq_client, LabeledBigQueryClient
+    ):
+      if not self._warned_unlabeled_client:
+        logger.warning(
+            "User-provided bigquery.Client is not a "
+            "LabeledBigQueryClient; SDK telemetry labels will not be "
+            "applied to jobs from this client. To opt in, construct "
+            "the client via bigquery_agent_analytics.make_bq_client() "
+            "or pass a LabeledBigQueryClient directly."
+        )
+        self._warned_unlabeled_client = True
     return self._bq_client
 
   # -------------------------------------------------------------- #
@@ -369,6 +420,7 @@ class Client:
               ),
           ]
       )
+      job_config = with_sdk_labels(job_config, feature="trace-read")
       results = list(
           self.bq_client.query(query, job_config=job_config).result()
       )
@@ -404,7 +456,10 @@ class Client:
           project=self.project_id,
           dataset=self.dataset_id,
       )
-      rows = list(self.bq_client.query(query).result())
+      job_config = with_sdk_labels(
+          bigquery.QueryJobConfig(), feature="trace-read"
+      )
+      rows = list(self.bq_client.query(query, job_config=job_config).result())
       existing = {r.get("table_name") for r in rows}
 
       for candidate in _AUTO_DETECT_TABLES:
@@ -476,6 +531,7 @@ class Client:
               ),
           ]
       )
+      job_config = with_sdk_labels(job_config, feature="trace-read")
       rows = list(
           self.bq_client.query(schema_query, job_config=job_config).result()
       )
@@ -508,6 +564,7 @@ class Client:
       ev_config = bigquery.QueryJobConfig(
           query_parameters=params,
       )
+      ev_config = with_sdk_labels(ev_config, feature="trace-read")
       ev_rows = list(
           self.bq_client.query(ev_query, job_config=ev_config).result()
       )
@@ -596,6 +653,7 @@ class Client:
     job_config = bigquery.QueryJobConfig(
         query_parameters=params,
     )
+    job_config = with_sdk_labels(job_config, feature="trace-read")
 
     rows = list(self.bq_client.query(query, job_config=job_config).result())
 
@@ -677,6 +735,7 @@ class Client:
             ),
         ]
     )
+    job_config = with_sdk_labels(job_config, feature="trace-read")
 
     results = list(self.bq_client.query(query, job_config=job_config).result())
 
@@ -740,6 +799,7 @@ class Client:
             ),
         ]
     )
+    job_config = with_sdk_labels(job_config, feature="trace-read")
 
     results = list(self.bq_client.query(query, job_config=job_config).result())
 
@@ -798,6 +858,7 @@ class Client:
     job_config = bigquery.QueryJobConfig(
         query_parameters=params,
     )
+    job_config = with_sdk_labels(job_config, feature="trace-read")
 
     results = list(self.bq_client.query(query, job_config=job_config).result())
     return _build_traces_from_rows(results)
@@ -877,6 +938,7 @@ class Client:
     job_config = bigquery.QueryJobConfig(
         query_parameters=params,
     )
+    job_config = with_sdk_labels(job_config, feature="eval-code")
 
     results = list(self.bq_client.query(query, job_config=job_config).result())
 
@@ -915,14 +977,27 @@ class Client:
     then falls back to the Gemini API.  Each path evaluates
     every criterion in the evaluator and merges the per-session
     scores into a single report.
+
+    Stamps ``report.details["execution_mode"]`` with one of
+    ``ai_generate``, ``ml_generate_text``, ``api_fallback`` so the
+    caller (and CI gates) can audit which path actually ran.
+    When an earlier tier raised before a later tier succeeded,
+    ``report.details["fallback_reason"]`` carries the chained
+    exception messages in attempt order. (The naming mirrors the
+    categorical evaluator's ``execution_mode`` value space for
+    consistency.)
     """
     criteria = evaluator._criteria
     if not criteria:
-      return _build_report(
+      report = _build_report(
           evaluator_name=evaluator.name,
           dataset=f"{self._table_ref} WHERE {where}",
           session_scores=[],
       )
+      report.details["execution_mode"] = "no_op"
+      return report
+
+    fallback_reasons: list[str] = []
 
     # Try AI.GENERATE (new path) when endpoint is not a legacy ref
     if not self._is_legacy_model_ref(self.endpoint):
@@ -937,17 +1012,20 @@ class Client:
               params,
           )
           criterion_reports.append((criterion, report))
-        return _merge_criterion_reports(
+        merged = _merge_criterion_reports(
             evaluator.name,
             f"{self._table_ref} WHERE {where}",
             criteria,
             criterion_reports,
         )
+        merged.details["execution_mode"] = "ai_generate"
+        return merged
       except Exception as e:
         logger.debug(
             "AI.GENERATE judge failed, trying legacy: %s",
             e,
         )
+        fallback_reasons.append(f"ai_generate: {e}")
 
     # Try legacy BQML batch evaluation
     text_model = (
@@ -968,20 +1046,29 @@ class Client:
             text_model,
         )
         criterion_reports.append((criterion, report))
-      return _merge_criterion_reports(
+      merged = _merge_criterion_reports(
           evaluator.name,
           f"{self._table_ref} WHERE {where}",
           criteria,
           criterion_reports,
       )
+      merged.details["execution_mode"] = "ml_generate_text"
+      if fallback_reasons:
+        merged.details["fallback_reason"] = "; ".join(fallback_reasons)
+      return merged
     except Exception as e:
       logger.debug(
           "BQML judge failed, falling back to API: %s",
           e,
       )
+      fallback_reasons.append(f"ml_generate_text: {e}")
 
     # Fallback: fetch traces using same table/filter, evaluate via API
-    return self._api_judge(evaluator, table, where, params)
+    api_report = self._api_judge(evaluator, table, where, params)
+    api_report.details["execution_mode"] = "api_fallback"
+    if fallback_reasons:
+      api_report.details["fallback_reason"] = "; ".join(fallback_reasons)
+    return api_report
 
   def _ai_generate_judge(
       self,
@@ -994,23 +1081,28 @@ class Client:
     """Evaluates using BigQuery AI.GENERATE with typed output."""
     from google.cloud import bigquery as bq
 
+    prefix, middle, suffix = split_judge_prompt_template(
+        criterion.prompt_template
+    )
     judge_params = list(params) + [
-        bq.ScalarQueryParameter(
-            "judge_prompt",
-            "STRING",
-            criterion.prompt_template.split("{trace_text}")[0],
-        ),
+        bq.ScalarQueryParameter("judge_prompt_prefix", "STRING", prefix),
+        bq.ScalarQueryParameter("judge_prompt_middle", "STRING", middle),
+        bq.ScalarQueryParameter("judge_prompt_suffix", "STRING", suffix),
     ]
 
-    query = AI_GENERATE_JUDGE_BATCH_QUERY.format(
+    query = render_ai_generate_judge_query(
         project=self.project_id,
         dataset=self.dataset_id,
         table=table,
         where=where,
         endpoint=self.endpoint,
+        connection_id=self.connection_id,
     )
     job_config = bq.QueryJobConfig(
         query_parameters=judge_params,
+    )
+    job_config = with_sdk_labels(
+        job_config, feature="eval-llm-judge", ai_function="ai-generate"
     )
 
     results = list(self.bq_client.query(query, job_config=job_config).result())
@@ -1058,12 +1150,13 @@ class Client:
     """Evaluates using BigQuery ML.GENERATE_TEXT."""
     from google.cloud import bigquery as bq
 
+    prefix, middle, suffix = split_judge_prompt_template(
+        criterion.prompt_template
+    )
     judge_params = list(params) + [
-        bq.ScalarQueryParameter(
-            "judge_prompt",
-            "STRING",
-            criterion.prompt_template.split("{trace_text}")[0],
-        ),
+        bq.ScalarQueryParameter("judge_prompt_prefix", "STRING", prefix),
+        bq.ScalarQueryParameter("judge_prompt_middle", "STRING", middle),
+        bq.ScalarQueryParameter("judge_prompt_suffix", "STRING", suffix),
     ]
 
     query = LLM_JUDGE_BATCH_QUERY.format(
@@ -1075,6 +1168,9 @@ class Client:
     )
     job_config = bq.QueryJobConfig(
         query_parameters=judge_params,
+    )
+    job_config = with_sdk_labels(
+        job_config, feature="eval-llm-judge", ai_function="ml-generate-text"
     )
 
     results = list(self.bq_client.query(query, job_config=job_config).result())
@@ -1133,7 +1229,10 @@ class Client:
         table=table,
         where=where,
     )
-    job_config = bigquery.QueryJobConfig(query_parameters=params)
+    job_config = with_sdk_labels(
+        bigquery.QueryJobConfig(query_parameters=params),
+        feature="eval-llm-judge",
+    )
     results = list(self.bq_client.query(query, job_config=job_config).result())
     traces = _build_traces_from_rows(results)
 
@@ -1250,7 +1349,7 @@ class Client:
 
     # Try AI.GENERATE.
     try:
-      session_results = self._categorical_ai_generate(
+      session_results, retry_meta = self._categorical_ai_generate(
           config,
           table,
           where,
@@ -1264,6 +1363,8 @@ class Client:
           config=config,
       )
       report.details["execution_mode"] = "ai_generate"
+      if retry_meta:
+        report.details["retry"] = retry_meta
       if classify_fallback_reason:
         report.details["classify_fallback_reason"] = classify_fallback_reason
       self._persist_categorical_if_configured(report, config, endpoint)
@@ -1334,6 +1435,11 @@ class Client:
     job_config = bigquery.QueryJobConfig(
         query_parameters=list(params),
     )
+    job_config = with_sdk_labels(
+        job_config,
+        feature="eval-categorical",
+        ai_function="ai-classify",
+    )
 
     results = list(self.bq_client.query(query, job_config=job_config).result())
 
@@ -1355,8 +1461,13 @@ class Client:
       params: list,
       endpoint: str,
       connection_id: Optional[str] = None,
-  ) -> list:
-    """Classifies sessions using BigQuery AI.GENERATE."""
+  ) -> tuple[list, dict]:
+    """Classifies sessions using BigQuery AI.GENERATE.
+
+    Sessions where AI.GENERATE returns NULL (e.g. due to rate
+    limiting or transient errors) are retried via the Gemini API
+    up to 3 times.
+    """
     prompt = build_categorical_prompt(config)
 
     query = build_ai_generate_query(
@@ -1367,6 +1478,7 @@ class Client:
         endpoint=endpoint,
         temperature=config.temperature,
         connection_id=connection_id,
+        max_output_tokens=config.max_output_tokens,
     )
 
     query_params = list(params) + [
@@ -1379,15 +1491,142 @@ class Client:
     job_config = bigquery.QueryJobConfig(
         query_parameters=query_params,
     )
+    job_config = with_sdk_labels(
+        job_config,
+        feature="eval-categorical",
+        ai_function="ai-generate",
+    )
 
     results = list(self.bq_client.query(query, job_config=job_config).result())
 
     session_results = []
+    failed_sessions = {}
     for row in results:
       r = dict(row)
       sid = r.get("session_id", "unknown")
-      session_results.append(parse_categorical_row(sid, r, config))
-    return session_results
+      parsed = parse_categorical_row(sid, r, config)
+      has_parse_error = any(m.parse_error for m in parsed.metrics)
+      if has_parse_error and r.get("transcript"):
+        failed_sessions[sid] = r.get("transcript", "")
+      session_results.append(parsed)
+
+    retry_meta = {}
+    if failed_sessions:
+      logger.warning(
+          "AI.GENERATE returned NULL/unparseable for %d session(s), "
+          "retrying via Gemini API: %s",
+          len(failed_sessions),
+          ", ".join(failed_sessions.keys()),
+      )
+      retried = self._retry_failed_sessions(
+          failed_sessions,
+          config,
+          endpoint,
+          max_retries=3,
+      )
+      resolved = 0
+      if retried:
+        retried_map = {r.session_id: r for r in retried}
+        session_results = [
+            retried_map.get(sr.session_id, sr) for sr in session_results
+        ]
+        resolved = sum(
+            1 for r in retried if not any(m.parse_error for m in r.metrics)
+        )
+        logger.info(
+            "Gemini API retry resolved %d/%d failed sessions",
+            resolved,
+            len(failed_sessions),
+        )
+      retry_meta = {
+          "failed_count": len(failed_sessions),
+          "retry_attempted": True,
+          "retry_resolved": resolved,
+          "retry_unresolved": len(failed_sessions) - resolved,
+      }
+
+    return session_results, retry_meta
+
+  def _retry_failed_sessions(
+      self,
+      transcripts: dict[str, str],
+      config: CategoricalEvaluationConfig,
+      endpoint: str,
+      max_retries: int = 3,
+  ) -> list:
+    """Retries classification for failed sessions via Gemini API.
+
+    Note: This method is synchronous and must not be called from
+    an async context with an already-running event loop.
+
+    Args:
+        transcripts: Maps session_id to transcript text.
+        config: Evaluation config.
+        endpoint: Model endpoint.
+        max_retries: Maximum number of retry attempts.
+
+    Returns:
+        List of CategoricalSessionResult for successfully retried
+        sessions.
+    """
+    remaining = dict(transcripts)
+    all_results = {}
+
+    for attempt in range(1, max_retries + 1):
+      if not remaining:
+        break
+      if attempt > 1:
+        backoff = 2 ** (attempt - 2)
+        logger.info(
+            "Retry backoff: sleeping %ds before attempt %d", backoff, attempt
+        )
+        time.sleep(backoff)
+      try:
+        results = _run_sync(
+            classify_sessions_via_api(remaining, config, endpoint)
+        )
+        still_failed = {}
+        for r in results:
+          has_error = any(m.parse_error for m in r.metrics)
+          if has_error:
+            if r.session_id in remaining:
+              still_failed[r.session_id] = remaining[r.session_id]
+              for m in r.metrics:
+                if m.parse_error:
+                  logger.warning(
+                      "Retry attempt %d, session %s, metric %s: "
+                      "parse_error=True, raw_response=%s",
+                      attempt,
+                      r.session_id,
+                      m.metric_name,
+                      repr(m.raw_response[:500] if m.raw_response else None),
+                  )
+                  break
+          else:
+            all_results[r.session_id] = r
+        remaining = still_failed
+        if remaining:
+          logger.warning(
+              "Retry attempt %d: %d sessions still unresolved",
+              attempt,
+              len(remaining),
+          )
+      except Exception as e:  # Broad catch: retry loop logs + continues
+        logger.warning(
+            "Gemini API retry attempt %d failed: %s (type=%s)",
+            attempt,
+            e,
+            type(e).__name__,
+        )
+
+    if remaining:
+      logger.warning(
+          "%d sessions still unresolved after %d retries",
+          len(remaining),
+          max_retries,
+      )
+
+    return list(all_results.values())
 
   def _categorical_api_fallback(
       self,
@@ -1409,7 +1648,10 @@ class Client:
         table=table,
         where=where,
     )
-    job_config = bigquery.QueryJobConfig(query_parameters=list(params))
+    job_config = with_sdk_labels(
+        bigquery.QueryJobConfig(query_parameters=list(params)),
+        feature="eval-categorical",
+    )
     rows = list(self.bq_client.query(query, job_config=job_config).result())
 
     transcripts = {}
@@ -1447,7 +1689,10 @@ class Client:
           dataset=self.dataset_id,
           results_table=results_table,
       )
-      self.bq_client.query(ddl).result()
+      ddl_config = with_sdk_labels(
+          bigquery.QueryJobConfig(), feature="eval-categorical"
+      )
+      self.bq_client.query(ddl, job_config=ddl_config).result()
 
       rows = flatten_results_to_rows(report, config, endpoint)
       table_ref = f"{self.project_id}.{self.dataset_id}.{results_table}"
@@ -1697,6 +1942,10 @@ class Client:
     job_config = bq.QueryJobConfig(
         query_parameters=extra_params,
     )
+    # Apply labels BEFORE executor dispatch so they materialize on the
+    # QueryJobConfig in the caller's thread — contextvars do not
+    # propagate across run_in_executor's thread boundary.
+    job_config = with_sdk_labels(job_config, feature="insights")
 
     job = await loop.run_in_executor(
         None,
@@ -1802,6 +2051,9 @@ class Client:
             ),
         ],
     )
+    job_config = with_sdk_labels(
+        job_config, feature="insights", ai_function="ai-generate"
+    )
 
     job = await loop.run_in_executor(
         None,
@@ -1851,6 +2103,9 @@ class Client:
             ),
         ],
     )
+    job_config = with_sdk_labels(
+        job_config, feature="insights", ai_function="ml-generate-text"
+    )
 
     job = await loop.run_in_executor(
         None,
@@ -1893,6 +2148,7 @@ class Client:
             ),
         ],
     )
+    job_config = with_sdk_labels(job_config, feature="insights")
 
     job = await loop.run_in_executor(
         None,

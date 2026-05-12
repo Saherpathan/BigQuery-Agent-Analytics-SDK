@@ -25,13 +25,13 @@ same delete-then-insert idempotency pattern as V3's
 
 Example usage::
 
-    from bigquery_agent_analytics.ontology_models import load_graph_spec
+    from bigquery_agent_analytics.resolved_spec import load_resolved_graph
     from bigquery_agent_analytics.ontology_graph import OntologyGraphManager
     from bigquery_agent_analytics.ontology_materializer import (
         OntologyMaterializer,
     )
 
-    spec = load_graph_spec("examples/ymgo_graph_spec.yaml", env="p.d")
+    spec = load_resolved_graph("examples/ymgo_graph_spec.yaml", env="p.d")
     mgr = OntologyGraphManager(
         project_id="my-project", dataset_id="analytics", spec=spec,
     )
@@ -55,13 +55,29 @@ import uuid
 
 from google.cloud import bigquery
 
-from .ontology_models import EntitySpec
-from .ontology_models import ExtractedEdge
-from .ontology_models import ExtractedGraph
-from .ontology_models import ExtractedNode
-from .ontology_models import GraphSpec
-from .ontology_models import PropertySpec
-from .ontology_models import RelationshipSpec
+from ._ontology_routing import build_name_to_column
+from ._ontology_routing import normalize_property_value
+from ._ontology_routing import parse_key_segment
+from ._telemetry import LabeledBigQueryClient
+from ._telemetry import make_bq_client
+from ._telemetry import with_sdk_labels
+from .extracted_models import ExtractedEdge
+from .extracted_models import ExtractedGraph
+from .extracted_models import ExtractedNode
+from .resolved_spec import resolve_from_graph_spec
+from .resolved_spec import ResolvedEntity
+from .resolved_spec import ResolvedGraph
+
+
+def _ensure_resolved(spec):
+  """Accept either ResolvedGraph or legacy GraphSpec, return ResolvedGraph."""
+  if isinstance(spec, ResolvedGraph):
+    return spec
+  return resolve_from_graph_spec(spec)
+
+
+from .resolved_spec import ResolvedProperty
+from .resolved_spec import ResolvedRelationship
 
 logger = logging.getLogger("bigquery_agent_analytics." + __name__)
 
@@ -138,38 +154,38 @@ def _ddl_type(yaml_type: str) -> str:
 # ------------------------------------------------------------------ #
 
 
-def _entity_columns(entity: EntitySpec) -> dict[str, str]:
+def _entity_columns(entity: ResolvedEntity) -> dict[str, str]:
   """Return ordered ``{col_name: DDL_TYPE}`` for an entity spec."""
   cols: dict[str, str] = {}
   for prop in entity.properties:
-    cols[prop.name] = _ddl_type(prop.type)
+    cols[prop.column] = _ddl_type(prop.sdk_type)
   cols.setdefault("session_id", "STRING")
   cols.setdefault("extracted_at", "TIMESTAMP")
   return cols
 
 
 def _relationship_columns(
-    rel: RelationshipSpec,
-    spec: GraphSpec,
+    rel: ResolvedRelationship,
+    spec: ResolvedGraph,
 ) -> dict[str, str]:
   """Return ordered ``{col_name: DDL_TYPE}`` for a relationship spec."""
   entity_map = {e.name: e for e in spec.entities}
   src = entity_map[rel.from_entity]
   tgt = entity_map[rel.to_entity]
-  src_prop_map = {p.name: p for p in src.properties}
-  tgt_prop_map = {p.name: p for p in tgt.properties}
+  src_prop_map = {p.column: p for p in src.properties}
+  tgt_prop_map = {p.column: p for p in tgt.properties}
 
   cols: dict[str, str] = {}
-  from_cols = rel.binding.from_columns or src.keys.primary
+  from_cols = rel.from_columns or src.key_columns
   for col in from_cols:
-    cols[col] = _ddl_type(src_prop_map[col].type)
-  to_cols = rel.binding.to_columns or tgt.keys.primary
+    cols[col] = _ddl_type(src_prop_map[col].sdk_type)
+  to_cols = rel.to_columns or tgt.key_columns
   for col in to_cols:
     if col not in cols:
-      cols[col] = _ddl_type(tgt_prop_map[col].type)
+      cols[col] = _ddl_type(tgt_prop_map[col].sdk_type)
   for prop in rel.properties:
-    if prop.name not in cols:
-      cols[prop.name] = _ddl_type(prop.type)
+    if prop.column not in cols:
+      cols[prop.column] = _ddl_type(prop.sdk_type)
   cols.setdefault("session_id", "STRING")
   cols.setdefault("extracted_at", "TIMESTAMP")
   return cols
@@ -201,7 +217,7 @@ def _columns_to_ddl(table_ref: str, columns: dict[str, str]) -> str:
 
 
 def compile_entity_ddl(
-    entity: EntitySpec,
+    entity: ResolvedEntity,
     project_id: str,
     dataset_id: str,
 ) -> str:
@@ -210,7 +226,7 @@ def compile_entity_ddl(
   Columns: all spec properties + metadata columns
   (``session_id``, ``extracted_at``).
   """
-  table_ref = entity.binding.source
+  table_ref = entity.source
   # If binding.source is already fully qualified (3-part), use as-is.
   # Otherwise, prefix with project.dataset.
   if table_ref.count(".") < 2:
@@ -220,8 +236,8 @@ def compile_entity_ddl(
 
 
 def compile_relationship_ddl(
-    rel: RelationshipSpec,
-    spec: GraphSpec,
+    rel: ResolvedRelationship,
+    spec: ResolvedGraph,
     project_id: str,
     dataset_id: str,
 ) -> str:
@@ -230,7 +246,7 @@ def compile_relationship_ddl(
   Columns: from-entity key columns + to-entity key columns +
   relationship properties + metadata.
   """
-  table_ref = rel.binding.source
+  table_ref = rel.source
   if table_ref.count(".") < 2:
     table_ref = f"{project_id}.{dataset_id}.{table_ref}"
 
@@ -244,51 +260,61 @@ def compile_relationship_ddl(
 
 def _route_node(
     node: ExtractedNode,
-    entity_spec: EntitySpec,
+    entity_spec: ResolvedEntity,
     session_id: str,
 ) -> dict:
   """Convert an ``ExtractedNode`` to a row dict for ``insert_rows_json``.
 
-  Only properties declared in the entity spec are included.  Extra
+  Only properties declared in the entity spec are included. Extra
   properties emitted by AI.GENERATE (e.g. hallucinated fields or
   fields belonging to a different entity type) are silently dropped
   to prevent ``insert_rows_json`` failures on non-schema columns.
+
+  Property-name resolution accepts both ``ResolvedProperty.logical_name``
+  (the ontology-level name an LLM extractor naturally produces) and
+  ``ResolvedProperty.column`` (the physical column name from the
+  binding). This matches the contract of
+  ``graph_validation.validate_extracted_graph(...)`` (issue #76):
+  the validator says "logical-name extraction is OK," and the
+  materializer must honor the same contract — otherwise a
+  validator-clean extraction silently drops renamed-binding
+  properties at INSERT time.
   """
-  schema_props = {p.name for p in entity_spec.properties}
+  # Build {accepted_name: physical_column} so we route renamed
+  # logical names to the actual BQ column. Uses the shared two-pass
+  # helper so collision precedence (logical name wins) matches the
+  # validator's _build_property_lookup exactly.
+  name_to_col = build_name_to_column(entity_spec.properties)
+  # Look up sdk_type per physical column for normalization. The
+  # validator legitimately accepts Python bytes / date / datetime
+  # for the corresponding SDK types, but insert_rows_json /
+  # load_table_from_json need JSON-compatible values; normalize
+  # before writing.
+  sdk_type_by_col = {p.column: p.sdk_type for p in entity_spec.properties}
+
   row: dict = {}
   for prop in node.properties:
-    if prop.name in schema_props:
-      row[prop.name] = prop.value
+    physical = name_to_col.get(prop.name)
+    if physical is not None:
+      row[physical] = normalize_property_value(
+          prop.value, sdk_type_by_col.get(physical, "string")
+      )
   row["session_id"] = session_id
   row["extracted_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
   return row
 
 
-def _parse_key_segment(node_id: str) -> dict[str, str]:
-  """Parse the key segment from a node ID.
-
-  Node IDs look like ``{session_id}:{entity_name}:{k1=v1,k2=v2}``.
-  Returns a dict of key-value pairs from the last segment, or empty
-  dict if the format is unexpected (e.g. index-based fallback IDs).
-  """
-  parts = node_id.split(":")
-  if len(parts) < 3:
-    return {}
-  key_segment = parts[-1]
-  if "=" not in key_segment:
-    return {}
-  result = {}
-  for pair in key_segment.split(","):
-    if "=" in pair:
-      k, v = pair.split("=", 1)
-      result[k] = v
-  return result
+# Backward-compat re-export. Older callers (and tests) import
+# ``_parse_key_segment`` from this module directly; the canonical
+# implementation now lives in ``_ontology_routing`` so the validator
+# and materializer share one source of truth.
+_parse_key_segment = parse_key_segment
 
 
 def _route_edge(
     edge: ExtractedEdge,
-    rel: RelationshipSpec,
-    spec: GraphSpec,
+    rel: ResolvedRelationship,
+    spec: ResolvedGraph,
     session_id: str,
 ) -> dict:
   """Convert an ``ExtractedEdge`` to a row dict for ``insert_rows_json``.
@@ -302,34 +328,41 @@ def _route_edge(
   # Map from-entity keys.  from_columns are a subset of the source
   # entity's primary keys, so the column names match the key names
   # in the parsed node ID segment.
-  from_keys = _parse_key_segment(edge.from_node_id)
-  if rel.binding.from_columns:
-    for col in rel.binding.from_columns:
+  from_keys = parse_key_segment(edge.from_node_id)
+  if rel.from_columns:
+    for col in rel.from_columns:
       row[col] = from_keys.get(col, "")
   else:
     row.update(from_keys)
 
   # Map to-entity keys (same logic).
-  to_keys = _parse_key_segment(edge.to_node_id)
-  if rel.binding.to_columns:
-    for col in rel.binding.to_columns:
+  to_keys = parse_key_segment(edge.to_node_id)
+  if rel.to_columns:
+    for col in rel.to_columns:
       row[col] = to_keys.get(col, "")
   else:
     row.update(to_keys)
 
   # Edge properties — only include properties declared in the spec.
-  # Extra AI-emitted fields are dropped to prevent insert failures.
-  schema_props = {p.name for p in rel.properties}
+  # Same shared helper as ``_route_node`` so collision precedence
+  # (logical name wins) matches the validator exactly. Same
+  # normalization step too so bytes / date / datetime values land
+  # as JSON-serializable forms.
+  edge_name_to_col = build_name_to_column(rel.properties)
+  edge_sdk_type_by_col = {p.column: p.sdk_type for p in rel.properties}
   for prop in edge.properties:
-    if prop.name in schema_props:
-      row[prop.name] = prop.value
+    physical = edge_name_to_col.get(prop.name)
+    if physical is not None:
+      row[physical] = normalize_property_value(
+          prop.value, edge_sdk_type_by_col.get(physical, "string")
+      )
 
   # Determine session_id for delete-scoped ownership.
   # For lineage edges with to_session_column, session_id = to_session value
   # so that the edge is owned by the destination session.
   # For normal edges, session_id = the session being processed (V4 behavior).
-  if rel.binding.to_session_column and rel.binding.to_session_column in row:
-    row["session_id"] = row[rel.binding.to_session_column]
+  if rel.to_session_column and rel.to_session_column in row:
+    row["session_id"] = row[rel.to_session_column]
   else:
     row["session_id"] = session_id
   row["extracted_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -361,7 +394,7 @@ class OntologyMaterializer:
   Args:
       project_id: GCP project ID.
       dataset_id: BigQuery dataset ID.
-      spec: A validated ``GraphSpec``.
+      spec: A validated ``ResolvedGraph``.
       bq_client: Optional pre-configured BigQuery client.
       location: BigQuery location.
       write_mode: Write strategy — ``'streaming'`` (default) uses
@@ -373,7 +406,7 @@ class OntologyMaterializer:
       self,
       project_id: str,
       dataset_id: str,
-      spec: GraphSpec,
+      spec: ResolvedGraph,
       bq_client: Optional[bigquery.Client] = None,
       location: Optional[str] = None,
       write_mode: str = "streaming",
@@ -385,19 +418,60 @@ class OntologyMaterializer:
       )
     self.project_id = project_id
     self.dataset_id = dataset_id
-    self.spec = spec
+    self.spec = _ensure_resolved(spec)
     self.location = location
     self.write_mode = write_mode
     self._bq_client = bq_client
+    self._warned_unlabeled_client = False
+
+  @classmethod
+  def from_ontology_binding(
+      cls,
+      ontology: "Ontology",
+      binding: "Binding",
+      lineage_config: Optional[dict] = None,
+      bq_client: Optional[bigquery.Client] = None,
+      location: Optional[str] = None,
+      write_mode: str = "streaming",
+  ) -> "OntologyMaterializer":
+    """Create from upstream Ontology + Binding.
+
+    Converts the separated ontology/binding pair into a ``ResolvedGraph``
+    via the resolver, then constructs the materializer.
+
+    ``project_id`` and ``dataset_id`` are taken from
+    ``binding.target`` so that the materializer's table resolution
+    is always consistent with the binding's source references.
+    """
+    from .resolved_spec import resolve
+
+    spec = resolve(ontology, binding, lineage_config=lineage_config)
+    return cls(
+        project_id=binding.target.project,
+        dataset_id=binding.target.dataset,
+        spec=spec,
+        bq_client=bq_client,
+        location=location,
+        write_mode=write_mode,
+    )
 
   @property
   def bq_client(self) -> bigquery.Client:
     """Lazily initializes the BigQuery client."""
     if self._bq_client is None:
-      kwargs: dict = {"project": self.project_id}
-      if self.location:
-        kwargs["location"] = self.location
-      self._bq_client = bigquery.Client(**kwargs)
+      self._bq_client = make_bq_client(self.project_id, location=self.location)
+    elif isinstance(self._bq_client, bigquery.Client) and not isinstance(
+        self._bq_client, LabeledBigQueryClient
+    ):
+      if not self._warned_unlabeled_client:
+        logger.warning(
+            "User-provided bigquery.Client is not a "
+            "LabeledBigQueryClient; SDK telemetry labels will not be "
+            "applied to jobs from this client. To opt in, construct "
+            "the client via bigquery_agent_analytics.make_bq_client() "
+            "or pass a LabeledBigQueryClient directly."
+        )
+        self._warned_unlabeled_client = True
     return self._bq_client
 
   def _table_ref(self, binding_source: str) -> str:
@@ -426,13 +500,13 @@ class OntologyMaterializer:
     table_names: dict[str, list[str]] = {}
 
     for entity in self.spec.entities:
-      table_ref = self._table_ref(entity.binding.source)
+      table_ref = self._table_ref(entity.source)
       merged = table_columns.setdefault(table_ref, {})
       _merge_columns(merged, _entity_columns(entity), table_ref)
       table_names.setdefault(table_ref, []).append(entity.name)
 
     for rel in self.spec.relationships:
-      table_ref = self._table_ref(rel.binding.source)
+      table_ref = self._table_ref(rel.source)
       merged = table_columns.setdefault(table_ref, {})
       _merge_columns(merged, _relationship_columns(rel, self.spec), table_ref)
       table_names.setdefault(table_ref, []).append(rel.name)
@@ -452,7 +526,7 @@ class OntologyMaterializer:
           f"Entity {entity_name!r} not found in spec. "
           f"Available: {sorted(entity_map.keys())}."
       )
-    table_ref = self._table_ref(entity_map[entity_name].binding.source)
+    table_ref = self._table_ref(entity_map[entity_name].source)
     table_ddl, _ = self._merged_table_ddl()
     return table_ddl[table_ref]
 
@@ -464,7 +538,7 @@ class OntologyMaterializer:
           f"Relationship {rel_name!r} not found in spec. "
           f"Available: {sorted(rel_map.keys())}."
       )
-    table_ref = self._table_ref(rel_map[rel_name].binding.source)
+    table_ref = self._table_ref(rel_map[rel_name].source)
     table_ddl, _ = self._merged_table_ddl()
     return table_ddl[table_ref]
 
@@ -502,7 +576,10 @@ class OntologyMaterializer:
     created = {}
     for table_ref, ddl in table_ddl.items():
       try:
-        job = self.bq_client.query(ddl)
+        job_config = with_sdk_labels(
+            bigquery.QueryJobConfig(), feature="ontology-build"
+        )
+        job = self.bq_client.query(ddl, job_config=job_config)
         job.result()
         for name in table_names[table_ref]:
           created[name] = table_ref
@@ -530,6 +607,7 @@ class OntologyMaterializer:
             bigquery.ArrayQueryParameter("session_ids", "STRING", session_ids),
         ]
     )
+    job_config = with_sdk_labels(job_config, feature="ontology-build")
     try:
       job = self.bq_client.query(
           _DELETE_FOR_SESSIONS.format(table_ref=table_ref),
@@ -585,6 +663,7 @@ class OntologyMaterializer:
           autodetect=False,
           schema=schema,
       )
+      job_config = with_sdk_labels(job_config, feature="ontology-build")
       load_job = self.bq_client.load_table_from_json(
           rows,
           staging_ref,
@@ -598,7 +677,10 @@ class OntologyMaterializer:
       # Step 3: Insert from staging into target.
       insert_sql = f"INSERT INTO `{table_ref}` SELECT * FROM `{staging_ref}`"
       try:
-        insert_job = self.bq_client.query(insert_sql)
+        insert_config = with_sdk_labels(
+            bigquery.QueryJobConfig(), feature="ontology-build"
+        )
+        insert_job = self.bq_client.query(insert_sql, job_config=insert_config)
         insert_job.result()
         insert_status = "inserted"
         rows_inserted = len(rows)
@@ -659,7 +741,7 @@ class OntologyMaterializer:
       if entity is None:
         logger.debug("Skipping node with unknown entity %r", node.entity_name)
         continue
-      table_ref = self._table_ref(entity.binding.source)
+      table_ref = self._table_ref(entity.source)
       parts = node.node_id.split(":")
       sid = parts[0] if parts else default_session_id
       row = _route_node(node, entity, sid)
@@ -675,7 +757,7 @@ class OntologyMaterializer:
             edge.relationship_name,
         )
         continue
-      table_ref = self._table_ref(rel.binding.source)
+      table_ref = self._table_ref(rel.source)
       parts = edge.from_node_id.split(":")
       sid = parts[0] if parts else default_session_id
       row = _route_edge(edge, rel, self.spec, sid)
@@ -724,9 +806,9 @@ class OntologyMaterializer:
       entity = entity_map.get(name)
       rel = rel_map.get(name)
       if entity:
-        ref = self._table_ref(entity.binding.source)
+        ref = self._table_ref(entity.source)
       elif rel:
-        ref = self._table_ref(rel.binding.source)
+        ref = self._table_ref(rel.source)
       else:
         continue
       if ref in inserted_tables:

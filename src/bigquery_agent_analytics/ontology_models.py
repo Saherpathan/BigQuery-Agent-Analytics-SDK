@@ -163,51 +163,13 @@ class GraphSpec(BaseModel):
 
 
 # ------------------------------------------------------------------ #
-# Extracted Models (AI output / runtime instances)                     #
+# Extracted Models (re-exported from extracted_models.py)              #
 # ------------------------------------------------------------------ #
 
-
-class ExtractedProperty(BaseModel):
-  """A single property value on an extracted node or edge."""
-
-  name: str = Field(description="Property name.")
-  value: Any = Field(description="Property value.")
-
-
-class ExtractedNode(BaseModel):
-  """A node instance extracted from agent telemetry."""
-
-  node_id: str = Field(description="Unique node identifier.")
-  entity_name: str = Field(description="Entity type from the spec.")
-  labels: list[str] = Field(default_factory=list, description="Node labels.")
-  properties: list[ExtractedProperty] = Field(
-      default_factory=list, description="Property values."
-  )
-
-
-class ExtractedEdge(BaseModel):
-  """An edge instance extracted from agent telemetry."""
-
-  edge_id: str = Field(description="Unique edge identifier.")
-  relationship_name: str = Field(description="Relationship type from the spec.")
-  from_node_id: str = Field(description="Source node ID.")
-  to_node_id: str = Field(description="Target node ID.")
-  properties: list[ExtractedProperty] = Field(
-      default_factory=list, description="Edge property values."
-  )
-
-
-class ExtractedGraph(BaseModel):
-  """A complete graph instance extracted from agent telemetry."""
-
-  name: str = Field(description="Graph name from the spec.")
-  nodes: list[ExtractedNode] = Field(
-      default_factory=list, description="Extracted nodes."
-  )
-  edges: list[ExtractedEdge] = Field(
-      default_factory=list, description="Extracted edges."
-  )
-
+from .extracted_models import ExtractedEdge
+from .extracted_models import ExtractedGraph
+from .extracted_models import ExtractedNode
+from .extracted_models import ExtractedProperty
 
 # ------------------------------------------------------------------ #
 # Loading & Validation                                                 #
@@ -394,3 +356,47 @@ def load_graph_spec(
   """
   yaml_string = Path(path).read_text(encoding="utf-8")
   return load_graph_spec_from_string(yaml_string, env=env)
+
+
+def load_from_ontology_binding(
+    ontology_path: str,
+    binding_path: str,
+    lineage_config: Optional[dict] = None,
+) -> GraphSpec:
+  """Load a ``GraphSpec`` from separated ontology + binding YAML files.
+
+  Uses the upstream ``bigquery_ontology`` loaders to parse and validate
+  the ontology and binding, then converts them to the SDK's ``GraphSpec``
+  via the runtime spec adapter. This is the dual-loader entry point for
+  the migration to the upstream ontology contract.
+
+  ``load_graph_spec()`` continues to work for combined GraphSpec YAML.
+  This function adds a second loading path for the separated format
+  without breaking the existing one.
+
+  Args:
+      ontology_path: Path to a ``*.ontology.yaml`` file.
+      binding_path: Path to a ``*.binding.yaml`` file.
+      lineage_config: Optional dict mapping relationship names to
+          ``LineageEdgeConfig`` for SDK-specific cross-session lineage.
+
+  Returns:
+      A validated ``GraphSpec`` with inheritance resolved.
+
+  Raises:
+      ImportError: If the ``bigquery_ontology`` package is not available.
+      ValueError: On validation failures or conversion errors.
+  """
+  from bigquery_ontology import load_binding
+  from bigquery_ontology import load_ontology
+
+  from .runtime_spec import graph_spec_from_ontology_binding
+
+  ontology = load_ontology(ontology_path)
+  binding = load_binding(binding_path, ontology=ontology)
+  spec = graph_spec_from_ontology_binding(
+      ontology, binding, lineage_config=lineage_config
+  )
+  _resolve_inheritance(spec)
+  _validate_graph_spec(spec)
+  return spec

@@ -25,10 +25,10 @@ lazy client initialization) without modifying V3 code.
 
 Example usage::
 
-    from bigquery_agent_analytics.ontology_models import load_graph_spec
+    from bigquery_agent_analytics.resolved_spec import load_resolved_graph
     from bigquery_agent_analytics.ontology_graph import OntologyGraphManager
 
-    spec = load_graph_spec("examples/ymgo_graph_spec.yaml", env="p.d")
+    spec = load_resolved_graph("examples/ymgo_graph_spec.yaml", env="p.d")
     mgr = OntologyGraphManager(
         project_id="my-project",
         dataset_id="analytics",
@@ -43,18 +43,32 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import pathlib
 from typing import Optional
 
 from google.cloud import bigquery
 
-from .ontology_models import EntitySpec
-from .ontology_models import ExtractedEdge
-from .ontology_models import ExtractedGraph
-from .ontology_models import ExtractedNode
-from .ontology_models import ExtractedProperty
-from .ontology_models import GraphSpec
+from ._telemetry import LabeledBigQueryClient
+from ._telemetry import make_bq_client
+from ._telemetry import with_sdk_labels
+from .extracted_models import ExtractedEdge
+from .extracted_models import ExtractedGraph
+from .extracted_models import ExtractedNode
+from .extracted_models import ExtractedProperty
 from .ontology_schema_compiler import compile_extraction_prompt
 from .ontology_schema_compiler import compile_output_schema
+from .resolved_spec import resolve_from_graph_spec
+from .resolved_spec import ResolvedEntity
+from .resolved_spec import ResolvedGraph
+
+
+def _ensure_resolved(spec):
+  """Accept either ResolvedGraph or legacy GraphSpec, return ResolvedGraph."""
+  if isinstance(spec, ResolvedGraph):
+    return spec
+  return resolve_from_graph_spec(spec)
+
+
 from .structured_extraction import run_structured_extractors
 from .structured_extraction import StructuredExtractor
 
@@ -163,7 +177,7 @@ ORDER BY base.timestamp ASC
 
 
 def _hydrate_graph(
-    spec: GraphSpec,
+    spec: ResolvedGraph,
     raw_rows: list[dict],
 ) -> ExtractedGraph:
   """Hydrate raw AI.GENERATE JSON rows into an ``ExtractedGraph``.
@@ -185,7 +199,7 @@ def _hydrate_graph(
   Edge IDs: ``{session_id}:{relationship_name}:{idx}``.
 
   Args:
-      spec: The ``GraphSpec`` used for extraction.
+      spec: The ``ResolvedGraph`` used for extraction.
       raw_rows: List of dicts with ``session_id`` and
           ``graph_json`` keys.
 
@@ -221,7 +235,7 @@ def _hydrate_graph(
     for idx, raw_node in enumerate(data.get("nodes", [])):
       entity_name = raw_node.get("entity_name", "")
       entity_spec = entity_map.get(entity_name)
-      labels = entity_spec.labels if entity_spec else [entity_name]
+      labels = list(entity_spec.labels) if entity_spec else [entity_name]
 
       node_id = _build_node_id(
           raw_node, entity_name, entity_spec, session_id, idx
@@ -287,7 +301,7 @@ def _build_key_string(keys_obj: dict) -> str:
 def _build_node_id(
     raw_node: dict,
     entity_name: str,
-    entity_spec: Optional[EntitySpec],
+    entity_spec: Optional[ResolvedEntity],
     session_id: str,
     idx: int,
 ) -> str:
@@ -303,7 +317,7 @@ def _build_node_id(
   """
   if entity_spec is not None:
     keys_obj = {}
-    for col in entity_spec.keys.primary:
+    for col in entity_spec.key_columns:
       if col not in raw_node:
         # Missing key column — fall back to index-based ID.
         return f"{session_id}:{entity_name}:{idx}"
@@ -350,7 +364,7 @@ class OntologyGraphManager:
   Args:
       project_id: GCP project ID.
       dataset_id: BigQuery dataset ID.
-      spec: A validated ``GraphSpec`` (from ``load_graph_spec``).
+      spec: A validated ``ResolvedGraph`` (from ``load_graph_spec``).
       table_id: Source telemetry table name.
       endpoint: AI.GENERATE model endpoint.
       location: BigQuery location.
@@ -361,7 +375,7 @@ class OntologyGraphManager:
       self,
       project_id: str,
       dataset_id: str,
-      spec: GraphSpec,
+      spec: ResolvedGraph,
       table_id: str = "agent_events",
       endpoint: str = "gemini-2.5-flash",
       location: Optional[str] = None,
@@ -370,21 +384,201 @@ class OntologyGraphManager:
   ) -> None:
     self.project_id = project_id
     self.dataset_id = dataset_id
-    self.spec = spec
+    self.spec = _ensure_resolved(spec)
     self.table_id = table_id
     self.endpoint = endpoint
     self.location = location
     self._bq_client = bq_client
+    self._warned_unlabeled_client = False
     self.extractors = extractors or {}
+    # Audit handle for the C2.c compiled-bundle path. Stays
+    # ``None`` for manager instances built via the legacy
+    # ``extractors=`` constructor parameter; set to the
+    # :class:`WrappedRegistry` produced by
+    # :meth:`from_bundles_root`. ``self.extractors`` is always
+    # the dict the runtime invokes — the registry is the audit
+    # object next to it.
+    self.runtime_registry: Optional["WrappedRegistry"] = None
+
+  @classmethod
+  def from_ontology_binding(
+      cls,
+      project_id: str,
+      dataset_id: str,
+      ontology: "Ontology",
+      binding: "Binding",
+      lineage_config: Optional[dict] = None,
+      table_id: str = "agent_events",
+      endpoint: str = "gemini-2.5-flash",
+      location: Optional[str] = None,
+      bq_client: Optional[bigquery.Client] = None,
+      extractors: Optional[dict[str, StructuredExtractor]] = None,
+  ) -> "OntologyGraphManager":
+    """Create from upstream Ontology + Binding.
+
+    Converts the separated ontology/binding pair into a ``ResolvedGraph``
+    via the resolver, then constructs the manager.
+
+    Note: ``project_id`` and ``dataset_id`` control where the manager
+    reads telemetry from (``{project}.{dataset}.{table_id}``). This
+    may differ from ``binding.target`` which controls where
+    materialized data is written. For the materializer and compiler,
+    use their ``from_ontology_binding()`` methods which derive
+    project/dataset from the binding target automatically.
+
+    Args:
+        project_id: GCP project where telemetry is stored.
+        dataset_id: BigQuery dataset where telemetry is stored.
+        ontology: Upstream Ontology object.
+        binding: Upstream Binding object.
+        lineage_config: Optional lineage session column config.
+        table_id: Source telemetry table name.
+        endpoint: AI.GENERATE model endpoint.
+        location: BigQuery location.
+        bq_client: Optional pre-configured BigQuery client.
+        extractors: Optional structured extractor registry.
+
+    Returns:
+        A configured ``OntologyGraphManager``.
+    """
+    from .resolved_spec import resolve
+
+    spec = resolve(ontology, binding, lineage_config=lineage_config)
+    return cls(
+        project_id=project_id,
+        dataset_id=dataset_id,
+        spec=spec,
+        table_id=table_id,
+        endpoint=endpoint,
+        location=location,
+        bq_client=bq_client,
+        extractors=extractors,
+    )
+
+  @classmethod
+  def from_bundles_root(
+      cls,
+      project_id: str,
+      dataset_id: str,
+      ontology: "Ontology",
+      binding: "Binding",
+      bundles_root: pathlib.Path,
+      expected_fingerprint: str,
+      fallback_extractors: dict[str, StructuredExtractor],
+      lineage_config: Optional[dict] = None,
+      table_id: str = "agent_events",
+      endpoint: str = "gemini-2.5-flash",
+      location: Optional[str] = None,
+      bq_client: Optional[bigquery.Client] = None,
+      event_type_allowlist: Optional[tuple[str, ...]] = None,
+      on_outcome: Optional["OutcomeCallback"] = None,
+  ) -> "OntologyGraphManager":
+    """Construct from ontology + binding *and* a compiled-bundle root.
+
+    The C2.c.2 entry point that actually puts compiled
+    extractors on the runtime path. Wires C2.a's
+    :func:`discover_bundles` and C2.b's
+    :func:`run_with_fallback` together via C2.c.1's
+    :func:`build_runtime_extractor_registry`, then constructs an
+    :class:`OntologyGraphManager` whose ``extractors`` dict is
+    the wrapped registry — so existing call sites that read
+    ``self.extractors`` and pass them through to
+    :func:`run_structured_extractors` pick up the
+    compiled-with-fallback behavior with no other changes.
+
+    The resulting manager exposes:
+
+    * ``manager.extractors`` — the dict the runtime invokes
+      (wrapped closures for event_types with both a compiled
+      bundle and a fallback; original fallback callables
+      otherwise).
+    * ``manager.runtime_registry`` — the full
+      :class:`WrappedRegistry` from C2.c.1, including
+      ``discovery``, ``bundles_without_fallback``, and
+      ``fallbacks_without_bundle`` for rollout-coverage
+      telemetry.
+
+    Args:
+      project_id: GCP project where telemetry is stored.
+      dataset_id: BigQuery dataset where telemetry is stored.
+      ontology: Upstream :class:`Ontology` object.
+      binding: Upstream :class:`Binding` object.
+      bundles_root: Directory containing compiled bundles.
+        Forwarded to :func:`discover_bundles`.
+      expected_fingerprint: Fingerprint the runtime computed
+        from its active inputs. Bundles whose manifest
+        fingerprint doesn't match are skipped at discovery.
+      fallback_extractors: ``event_type -> handwritten
+        callable``. Required: C2.b's safety contract uses the
+        fallback as the authoritative baseline against which
+        the compiled output is compared. Validated at build
+        time (non-str keys, empty-string keys, non-callable
+        values, and callables that can't accept ``(event,
+        spec)`` are rejected with ``TypeError``).
+      lineage_config: Optional lineage session column config
+        forwarded to :func:`resolve`.
+      table_id: Source telemetry table name.
+      endpoint: ``AI.GENERATE`` model endpoint for the
+        non-compiled extraction path.
+      location: BigQuery location.
+      bq_client: Optional pre-configured BigQuery client.
+      event_type_allowlist: Optional. Filters both compiled
+        bundles and fallback extractors to the named event
+        types; ``None`` considers everything.
+      on_outcome: Optional ``(event_type, outcome) -> None``
+        invoked from inside each wrapped extractor on every
+        event including ``compiled_unchanged`` outcomes —
+        denominator metric for compiled-vs-fallback rates.
+        Callback exceptions propagate.
+
+    Returns:
+      A configured :class:`OntologyGraphManager` with
+      ``runtime_registry`` set.
+    """
+    from .extractor_compilation import build_runtime_extractor_registry
+    from .resolved_spec import resolve
+
+    spec = resolve(ontology, binding, lineage_config=lineage_config)
+
+    registry = build_runtime_extractor_registry(
+        bundles_root=bundles_root,
+        expected_fingerprint=expected_fingerprint,
+        fallback_extractors=fallback_extractors,
+        resolved_graph=spec,
+        event_type_allowlist=event_type_allowlist,
+        on_outcome=on_outcome,
+    )
+
+    manager = cls(
+        project_id=project_id,
+        dataset_id=dataset_id,
+        spec=spec,
+        table_id=table_id,
+        endpoint=endpoint,
+        location=location,
+        bq_client=bq_client,
+        extractors=registry.extractors,
+    )
+    manager.runtime_registry = registry
+    return manager
 
   @property
   def bq_client(self) -> bigquery.Client:
     """Lazily initializes the BigQuery client."""
     if self._bq_client is None:
-      kwargs: dict = {"project": self.project_id}
-      if self.location:
-        kwargs["location"] = self.location
-      self._bq_client = bigquery.Client(**kwargs)
+      self._bq_client = make_bq_client(self.project_id, location=self.location)
+    elif isinstance(self._bq_client, bigquery.Client) and not isinstance(
+        self._bq_client, LabeledBigQueryClient
+    ):
+      if not self._warned_unlabeled_client:
+        logger.warning(
+            "User-provided bigquery.Client is not a "
+            "LabeledBigQueryClient; SDK telemetry labels will not be "
+            "applied to jobs from this client. To opt in, construct "
+            "the client via bigquery_agent_analytics.make_bq_client() "
+            "or pass a LabeledBigQueryClient directly."
+        )
+        self._warned_unlabeled_client = True
     return self._bq_client
 
   def _resolve_endpoint(self) -> str:
@@ -531,6 +725,7 @@ class OntologyGraphManager:
             ),
         ]
     )
+    job_config = with_sdk_labels(job_config, feature="ontology-build")
     try:
       job = self.bq_client.query(query, job_config=job_config)
       events = []
@@ -597,6 +792,9 @@ class OntologyGraphManager:
             ),
         ]
     )
+    job_config = with_sdk_labels(
+        job_config, feature="ontology-build", ai_function="ai-generate"
+    )
 
     try:
       job = self.bq_client.query(query, job_config=job_config)
@@ -620,6 +818,7 @@ class OntologyGraphManager:
             bigquery.ArrayQueryParameter("session_ids", "STRING", session_ids),
         ]
     )
+    job_config = with_sdk_labels(job_config, feature="ontology-build")
 
     try:
       job = self.bq_client.query(query, job_config=job_config)
@@ -669,7 +868,7 @@ def detect_lineage_edges(
     current_session_id: str,
     prior_graphs: dict[str, ExtractedGraph],
     lineage_entity_types: list[str],
-    spec: GraphSpec,
+    spec: ResolvedGraph,
 ) -> list[ExtractedEdge]:
   """Detect evolution edges between current and prior session graphs.
 
@@ -683,7 +882,7 @@ def detect_lineage_edges(
       prior_graphs: Dict of ``{session_id: ExtractedGraph}`` for
           prior sessions.
       lineage_entity_types: Entity names to check for evolution.
-      spec: GraphSpec for entity key lookups.
+      spec: ResolvedGraph for entity key lookups.
 
   Returns:
       List of ``ExtractedEdge`` instances for lineage relationships.
@@ -696,7 +895,7 @@ def detect_lineage_edges(
     if entity_spec is None:
       continue
 
-    key_cols = entity_spec.keys.primary
+    key_cols = entity_spec.key_columns
 
     # Index current-session nodes by primary key values.
     current_by_key: dict[str, ExtractedNode] = {}

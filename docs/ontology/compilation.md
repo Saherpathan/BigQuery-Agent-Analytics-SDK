@@ -276,6 +276,11 @@ On top of ontology-level (`ontology.md` §10) and binding-level
 3. No cycles among derived properties.
 4. Every logical property type is supported by the target backend
    (`ontology.md` §7).
+5. **No abstract elements in bindings.** The binding loader already
+   rejects bindings that target abstract entities or relationships
+   (`ontology.md` §3a). The compiler guards against this as
+   defense-in-depth so a hand-constructed `Binding` object that skips
+   the loader still raises rather than emitting unresolvable DDL.
 
 Warnings: bound entity referenced by no relationship.
 
@@ -284,6 +289,33 @@ Warnings: bound entity referenced by no relationship.
 One `CREATE PROPERTY GRAPH` per compile. Node tables sorted alphabetically,
 then edge tables sorted alphabetically. Property lists follow ontology
 declaration order.
+
+## 7a. Sibling emitter: concept index
+
+`compile_graph` is paired with a sibling emitter, `compile_concept_index`,
+exposed via the `--emit-concept-index` flag on `gm compile`. When set, the
+combined output appends two atomic-per-statement `CREATE OR REPLACE TABLE`
+statements (a main concept-index table and its `__meta` provenance
+sibling) after the property-graph DDL. Without the flag, `gm compile`
+output is byte-identical to today.
+
+The two emitters are intentionally **independent functions**:
+
+- `compile_graph(ontology, binding) -> str` is unchanged in shape and
+  contract.
+- `compile_concept_index(ontology, binding, *, output_table,
+  compiler_version) -> str` is additive — same `(Ontology, Binding)`
+  inputs, different downstream consumer (the SDK's runtime resolver
+  layer rather than a property-graph backend).
+
+Both are pure SQL emitters. Neither calls BigQuery; the operator runs
+the emitted text via `bq query` or any equivalent path. The CLI
+composes the two outputs into a single text stream when both are
+requested.
+
+See [`concept-index.md`](concept-index.md) for the full schema,
+provenance contract (`compile_id` short display vs
+`compile_fingerprint` 64-hex integrity key), and runtime contract.
 
 ## 8. Open questions
 

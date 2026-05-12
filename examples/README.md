@@ -13,7 +13,9 @@ artifacts that demonstrate SDK capabilities.
 | [ai_ml_integration_demo.ipynb](ai_ml_integration_demo.ipynb) | AI.GENERATE, AI.EMBED, anomaly detection |
 | [categorical_evaluation_demo.ipynb](categorical_evaluation_demo.ipynb) | Hatteras categorical evaluation |
 | [context_graph_adcp_demo.ipynb](context_graph_adcp_demo.ipynb) | Property Graph use cases |
-| [ontology_graph_v4_demo.ipynb](ontology_graph_v4_demo.ipynb) | Ontology extraction + GQL |
+| [ontology_graph_v5_demo.ipynb](ontology_graph_v5_demo.ipynb) | OWL import, mixed extraction, temporal lineage, GQL |
+| [migration_v5_demo_notebook.ipynb](migration_v5_demo_notebook.ipynb) | Migrated V5 pipeline using separated ontology + binding |
+| [ontology_graph_v4_demo.ipynb](ontology_graph_v4_demo.ipynb) | Ontology extraction + GQL **(legacy)** |
 | [memory_service_demo.ipynb](memory_service_demo.ipynb) | Cross-session memory |
 | [event_semantics_views_bigframes_demo.ipynb](event_semantics_views_bigframes_demo.ipynb) | Event views + BigFrames |
 | [nba_agent_trace_analysis_notebook.ipynb](nba_agent_trace_analysis_notebook.ipynb) | Real-world trace analysis |
@@ -45,9 +47,21 @@ artifacts that demonstrate SDK capabilities.
 | [cli_agent_tool.py](cli_agent_tool.py) | CLI agent tool example |
 | [ci_eval_pipeline.sh](ci_eval_pipeline.sh) | CI evaluation pipeline |
 
+## Demo Bundles
+
+| Directory | Description |
+|-----------|-------------|
+| [agent_improvement_cycle/](agent_improvement_cycle/) | LoopAgent-driven prompt improvement cycle |
+| [decision_lineage_demo/](decision_lineage_demo/) | Decision-lineage property graph (issue #98): live ADK media-planner agent + BQ AA Plugin running across 6 campaign sessions → SDK `build_context_graph(use_ai_generate=True, include_decisions=True)` → six GQL blocks pasted into BigQuery Studio (one renders an interactive graph diagram, one is a portfolio roll-up) |
+
 ## Reference Artifacts
 
 | File | Description |
 |------|-------------|
 | [e2e_demo_output.txt](e2e_demo_output.txt) | Expected output from e2e_demo.py |
-| [ymgo_graph_spec.yaml](ymgo_graph_spec.yaml) | Example ontology YAML specification |
+| [ymgo_graph_spec.yaml](ymgo_graph_spec.yaml) | Example ontology YAML specification **(legacy)** |
+
+> **Note:** `ontology_graph_v4_demo.ipynb` and `ymgo_graph_spec.yaml` use the legacy combined
+> `GraphSpec` format. The current approach uses separated ontology + binding YAML files with
+> `load_ontology()` + `load_binding()` from `bigquery_ontology`. See `ontology_graph_v5_demo.ipynb`
+> or `migration_v5_demo_notebook.ipynb`.

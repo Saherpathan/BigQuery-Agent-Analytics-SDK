@@ -27,9 +27,20 @@ from __future__ import annotations
 from pathlib import Path
 import textwrap
 
+import pytest
 from typer.testing import CliRunner
 
 from bigquery_ontology.cli import app
+
+_has_rdflib = True
+try:
+  import rdflib  # noqa: F401
+except ImportError:
+  _has_rdflib = False
+
+_requires_rdflib = pytest.mark.skipif(
+    not _has_rdflib, reason="rdflib not installed"
+)
 
 # NOTE: Click's CliRunner merges stderr into ``result.output`` by default
 # (``mix_stderr=True``). The CLI writes errors to stderr, so all
@@ -794,3 +805,475 @@ def test_validate_missing_file_with_json_emits_structured_json(tmp_path):
   )
   assert result.exit_code == 2
   assert result.output == expected
+
+
+# --------------------------------------------------------------------- #
+# gm import-owl                                                          #
+# --------------------------------------------------------------------- #
+#
+# The import-owl tests require rdflib, which is an optional dependency.
+# Tests that exercise the importer's core logic are in
+# ``test_owl_importer.py``; these tests verify the CLI surface:
+# argument parsing, output routing, error formatting, and exit codes.
+
+_TINY_TURTLE = """\
+@prefix : <http://example.com/test#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+:Thing a owl:Class ;
+    rdfs:label "Thing" ;
+    owl:hasKey ( :thing_id ) .
+
+:thing_id a owl:DatatypeProperty ;
+    rdfs:domain :Thing ;
+    rdfs:range xsd:string .
+"""
+
+_TURTLE_WITH_DROPS = """\
+@prefix : <http://example.com/test#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+:Alpha a owl:Class ;
+    rdfs:label "Alpha" ;
+    owl:hasKey ( :alpha_id ) ;
+    owl:disjointWith :Beta .
+
+:Beta a owl:Class ;
+    rdfs:label "Beta" ;
+    owl:hasKey ( :beta_id ) .
+
+:alpha_id a owl:DatatypeProperty ;
+    rdfs:domain :Alpha ;
+    rdfs:range xsd:string .
+
+:beta_id a owl:DatatypeProperty ;
+    rdfs:domain :Beta ;
+    rdfs:range xsd:string .
+"""
+
+
+@_requires_rdflib
+def test_import_owl_golden_path_writes_yaml_to_stdout(tmp_path):
+  ttl = _write(tmp_path, "test.ttl", _TINY_TURTLE)
+
+  result = _RUNNER.invoke(
+      app,
+      [
+          "import-owl",
+          str(ttl),
+          "--include-namespace",
+          "http://example.com/test#",
+      ],
+  )
+
+  assert result.exit_code == 0
+  assert "ontology: test" in result.output
+  assert "name: Thing" in result.output
+  assert "name: thing_id" in result.output
+
+
+@_requires_rdflib
+def test_import_owl_output_flag_writes_to_file(tmp_path):
+  ttl = _write(tmp_path, "test.ttl", _TINY_TURTLE)
+  out = tmp_path / "out.ontology.yaml"
+
+  result = _RUNNER.invoke(
+      app,
+      [
+          "import-owl",
+          str(ttl),
+          "--include-namespace",
+          "http://example.com/test#",
+          "-o",
+          str(out),
+      ],
+  )
+
+  assert result.exit_code == 0
+  content = out.read_text(encoding="utf-8")
+  assert "ontology: test" in content
+  assert "name: Thing" in content
+
+
+@_requires_rdflib
+def test_import_owl_drop_summary_on_stderr(tmp_path):
+  ttl = _write(tmp_path, "test.ttl", _TURTLE_WITH_DROPS)
+
+  result = _RUNNER.invoke(
+      app,
+      [
+          "import-owl",
+          str(ttl),
+          "--include-namespace",
+          "http://example.com/test#",
+      ],
+  )
+
+  assert result.exit_code == 0
+  assert "Dropped OWL features" in result.output
+  assert "owl:disjointWith: 1" in result.output
+
+
+@_requires_rdflib
+def test_import_owl_format_flag_ttl(tmp_path):
+  ttl = _write(tmp_path, "test.owl", _TINY_TURTLE)
+
+  result = _RUNNER.invoke(
+      app,
+      [
+          "import-owl",
+          str(ttl),
+          "--include-namespace",
+          "http://example.com/test#",
+          "--format",
+          "ttl",
+      ],
+  )
+
+  assert result.exit_code == 0
+  assert "ontology: test" in result.output
+
+
+@_requires_rdflib
+def test_import_owl_multiple_namespaces(tmp_path):
+  multi_ns = """\
+@prefix a: <http://example.com/ns_a#> .
+@prefix b: <http://example.com/ns_b#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+a:Foo a owl:Class ; rdfs:label "Foo" ; owl:hasKey ( a:foo_id ) .
+a:foo_id a owl:DatatypeProperty ; rdfs:domain a:Foo ; rdfs:range xsd:string .
+
+b:Bar a owl:Class ; rdfs:label "Bar" ; owl:hasKey ( b:bar_id ) .
+b:bar_id a owl:DatatypeProperty ; rdfs:domain b:Bar ; rdfs:range xsd:string .
+"""
+  ttl = _write(tmp_path, "multi.ttl", multi_ns)
+
+  result = _RUNNER.invoke(
+      app,
+      [
+          "import-owl",
+          str(ttl),
+          "--include-namespace",
+          "http://example.com/ns_a#",
+          "--include-namespace",
+          "http://example.com/ns_b#",
+      ],
+  )
+
+  assert result.exit_code == 0
+  assert "name: Foo" in result.output
+  assert "name: Bar" in result.output
+
+
+def test_import_owl_missing_source_file_is_usage_error(tmp_path):
+  missing = tmp_path / "nope.ttl"
+
+  result = _RUNNER.invoke(
+      app,
+      [
+          "import-owl",
+          str(missing),
+          "--include-namespace",
+          "http://example.com/test#",
+      ],
+  )
+
+  expected = (
+      f"{missing}:0:0: cli-missing-file \u2014 File not found: {missing}\n"
+  )
+  assert result.exit_code == 2
+  assert result.output == expected
+
+
+def test_import_owl_missing_file_json_emits_structured_json(tmp_path):
+  missing = tmp_path / "nope.ttl"
+
+  result = _RUNNER.invoke(
+      app,
+      [
+          "import-owl",
+          str(missing),
+          "--include-namespace",
+          "http://example.com/test#",
+          "--json",
+      ],
+  )
+
+  assert result.exit_code == 2
+  assert "cli-missing-file" in result.output
+
+
+def test_import_owl_bad_format_is_usage_error(tmp_path):
+  ttl = _write(tmp_path, "test.ttl", _TINY_TURTLE)
+
+  result = _RUNNER.invoke(
+      app,
+      [
+          "import-owl",
+          str(ttl),
+          "--include-namespace",
+          "http://example.com/test#",
+          "--format",
+          "badvalue",
+      ],
+  )
+
+  assert result.exit_code == 2
+  assert "cli-usage" in result.output
+  assert "badvalue" in result.output
+
+
+@_requires_rdflib
+def test_import_owl_output_to_nonexistent_dir_emits_error(tmp_path):
+  ttl = _write(tmp_path, "test.ttl", _TINY_TURTLE)
+  bad_output = tmp_path / "no" / "such" / "dir" / "out.yaml"
+
+  result = _RUNNER.invoke(
+      app,
+      [
+          "import-owl",
+          str(ttl),
+          "--include-namespace",
+          "http://example.com/test#",
+          "-o",
+          str(bad_output),
+      ],
+  )
+
+  assert result.exit_code == 1
+  assert "cli-output-error" in result.output
+
+
+@_requires_rdflib
+def test_import_owl_missing_rdflib_exits_2(tmp_path):
+  ttl = _write(tmp_path, "test.ttl", _TINY_TURTLE)
+
+  import unittest.mock
+
+  with unittest.mock.patch.dict(
+      "sys.modules", {"bigquery_ontology.owl_importer": None}
+  ):
+    result = _RUNNER.invoke(
+        app,
+        [
+            "import-owl",
+            str(ttl),
+            "--include-namespace",
+            "http://example.com/test#",
+        ],
+    )
+
+  assert result.exit_code == 2
+  assert "cli-missing-dependency" in result.output
+  assert "pip install" in result.output
+
+
+@_requires_rdflib
+def test_import_owl_output_to_existing_directory_emits_error(tmp_path):
+  ttl = _write(tmp_path, "test.ttl", _TINY_TURTLE)
+  existing_dir = tmp_path / "a_directory"
+  existing_dir.mkdir()
+
+  result = _RUNNER.invoke(
+      app,
+      [
+          "import-owl",
+          str(ttl),
+          "--include-namespace",
+          "http://example.com/test#",
+          "-o",
+          str(existing_dir),
+      ],
+  )
+
+  assert result.exit_code == 1
+  assert "cli-output-error" in result.output
+
+
+# --------------------------------------------------------------------- #
+# gm compile --emit-concept-index (A7)                                  #
+# --------------------------------------------------------------------- #
+
+
+def test_compile_without_emit_concept_index_is_byte_identical(tmp_path):
+  """Regression guard: omitting ``--emit-concept-index`` produces the
+  exact same DDL as before A7 landed.
+  """
+  _write(tmp_path, "tiny.ontology.yaml", _COMPILE_ONTOLOGY)
+  binding = _write(tmp_path, "tiny.binding.yaml", _COMPILE_BINDING)
+  result = _RUNNER.invoke(app, ["compile", str(binding)])
+
+  assert result.exit_code == 0
+  assert result.output == _COMPILE_EXPECTED_DDL
+
+
+def test_compile_emit_concept_index_requires_table_flag(tmp_path):
+  """``--emit-concept-index`` with no ``--concept-index-table`` is
+  rejected — no silent global default per the RFC.
+  """
+  _write(tmp_path, "tiny.ontology.yaml", _COMPILE_ONTOLOGY)
+  binding = _write(tmp_path, "tiny.binding.yaml", _COMPILE_BINDING)
+
+  result = _RUNNER.invoke(
+      app, ["compile", str(binding), "--emit-concept-index"]
+  )
+
+  assert result.exit_code != 0
+  assert "--concept-index-table" in result.output
+
+
+def test_compile_emit_concept_index_appends_two_create_or_replace_statements(
+    tmp_path,
+):
+  """Happy path: both the property-graph DDL and the concept-index
+  SQL (main + meta) appear on stdout.
+  """
+  _write(tmp_path, "tiny.ontology.yaml", _COMPILE_ONTOLOGY)
+  binding = _write(tmp_path, "tiny.binding.yaml", _COMPILE_BINDING)
+
+  result = _RUNNER.invoke(
+      app,
+      [
+          "compile",
+          str(binding),
+          "--emit-concept-index",
+          "--concept-index-table",
+          "p.d.tiny_concept_index",
+      ],
+  )
+
+  assert result.exit_code == 0
+  # Property-graph DDL comes first, unchanged.
+  assert "CREATE PROPERTY GRAPH" in result.output
+  # Then two concept-index CREATE OR REPLACE statements (main + meta).
+  assert result.output.count("CREATE OR REPLACE TABLE") == 2
+  assert "`p.d.tiny_concept_index`" in result.output
+  assert "`p.d.tiny_concept_index__meta`" in result.output
+
+
+def test_compile_emit_concept_index_with_output_flag_writes_combined_sql(
+    tmp_path,
+):
+  """``-o PATH`` with the emit flag lands the combined SQL in the
+  named file and leaves stdout empty.
+  """
+  _write(tmp_path, "tiny.ontology.yaml", _COMPILE_ONTOLOGY)
+  binding = _write(tmp_path, "tiny.binding.yaml", _COMPILE_BINDING)
+  out_path = tmp_path / "combined.sql"
+
+  result = _RUNNER.invoke(
+      app,
+      [
+          "compile",
+          str(binding),
+          "--emit-concept-index",
+          "--concept-index-table",
+          "p.d.tiny_concept_index",
+          "-o",
+          str(out_path),
+      ],
+  )
+
+  assert result.exit_code == 0
+  assert result.output == ""
+  body = out_path.read_text(encoding="utf-8")
+  assert "CREATE PROPERTY GRAPH" in body
+  assert body.count("CREATE OR REPLACE TABLE") == 2
+
+
+def test_compile_emit_concept_index_invalid_table_path_fails(tmp_path):
+  """An ``--concept-index-table`` value that fails A3-A5 validation
+  surfaces as a clean compile-time error.
+  """
+  _write(tmp_path, "tiny.ontology.yaml", _COMPILE_ONTOLOGY)
+  binding = _write(tmp_path, "tiny.binding.yaml", _COMPILE_BINDING)
+
+  result = _RUNNER.invoke(
+      app,
+      [
+          "compile",
+          str(binding),
+          "--emit-concept-index",
+          "--concept-index-table",
+          "not-three-segments",
+      ],
+  )
+
+  assert result.exit_code == 1
+  assert "project.dataset.table" in result.output
+
+
+def test_compile_emit_concept_index_is_deterministic_across_runs(tmp_path):
+  """D2 round-trip: re-running with the same inputs produces
+  byte-identical combined output.
+  """
+  _write(tmp_path, "tiny.ontology.yaml", _COMPILE_ONTOLOGY)
+  binding = _write(tmp_path, "tiny.binding.yaml", _COMPILE_BINDING)
+  flags = [
+      "compile",
+      str(binding),
+      "--emit-concept-index",
+      "--concept-index-table",
+      "p.d.tiny_concept_index",
+  ]
+  out1 = _RUNNER.invoke(app, flags).output
+  out2 = _RUNNER.invoke(app, flags).output
+  assert out1 == out2
+
+
+def test_compile_emit_concept_index_with_explicit_compiler_version(tmp_path):
+  """``--compiler-version`` overrides the default. The version string
+  flows into ``compile_fingerprint`` so the meta row reflects it.
+  """
+  _write(tmp_path, "tiny.ontology.yaml", _COMPILE_ONTOLOGY)
+  binding = _write(tmp_path, "tiny.binding.yaml", _COMPILE_BINDING)
+
+  result = _RUNNER.invoke(
+      app,
+      [
+          "compile",
+          str(binding),
+          "--emit-concept-index",
+          "--concept-index-table",
+          "p.d.tiny_concept_index",
+          "--compiler-version",
+          "test-pin-1.2.3",
+      ],
+  )
+
+  assert result.exit_code == 0
+  # The version string appears in the meta row's compiler_version column.
+  assert "'test-pin-1.2.3'" in result.output
+
+
+def test_compile_emit_concept_index_default_compiler_version_is_stable(
+    tmp_path,
+):
+  """Without ``--compiler-version`` the default is the package
+  version; same default → same fingerprint → byte-identical SQL.
+  """
+  _write(tmp_path, "tiny.ontology.yaml", _COMPILE_ONTOLOGY)
+  binding = _write(tmp_path, "tiny.binding.yaml", _COMPILE_BINDING)
+  flags = [
+      "compile",
+      str(binding),
+      "--emit-concept-index",
+      "--concept-index-table",
+      "p.d.tiny_concept_index",
+  ]
+  out1 = _RUNNER.invoke(app, flags).output
+  out2 = _RUNNER.invoke(app, flags).output
+  assert out1 == out2
+  # The meta row carries some non-empty compiler_version string.
+  meta_section = out1[out1.index("__meta") :]
+  # Find a quoted compiler-version-shaped value (heuristic: any
+  # non-empty string literal in the meta section that isn't a
+  # fingerprint or short id).
+  assert "'" in meta_section

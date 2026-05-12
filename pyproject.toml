@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bigquery-agent-analytics"
-version = "0.1.0"
+version = "0.2.3"
 description = "SDK for analyzing and evaluating agent traces stored in BigQuery."
 readme = "README.md"
 license = "Apache-2.0"
@@ -39,15 +39,25 @@ llm = [
 bigframes = [
   "bigframes>=1.0.0",
 ]
+owl = [
+  "rdflib>=7.0",
+]
 cli = []
 dev = [
   "pytest>=7.0",
   "pytest-asyncio>=0.21",
   "pyink>=24.3.0",
   "isort>=5.0",
+  "jsonschema>=4.0",
+]
+improvement = [
+  "google-genai>=1.0.0",
+  "google-cloud-aiplatform>=1.148.0",
+  "pandas>=2.0.0",
+  "python-dotenv>=1.0.0",
 ]
 all = [
-  "bigquery-agent-analytics[llm,bigframes,cli,dev]",
+  "bigquery-agent-analytics[llm,bigframes,owl,cli,dev,improvement]",
 ]
 
 [project.scripts]
@@ -56,6 +66,7 @@ gm = "bigquery_ontology.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/bigquery_agent_analytics", "src/bigquery_ontology"]
+exclude = ["src/bigquery_ontology/docs"]
 
 [tool.pyink]
 line-length = 80

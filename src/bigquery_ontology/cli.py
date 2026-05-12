@@ -17,16 +17,19 @@
 ``gm validate`` accepts either an ontology YAML or a binding YAML and
 dispatches to the matching loader. ``gm compile`` takes a binding YAML
 and emits the corresponding ``CREATE PROPERTY GRAPH`` DDL on stdout
-(or to ``-o PATH``). Both commands resolve a binding's companion
-ontology by auto-discovering ``<name>.ontology.yaml`` next to the
-binding; ``--ontology PATH`` overrides that lookup.
+(or to ``-o PATH``). ``gm scaffold`` generates starter ``CREATE TABLE``
+DDL and a matching binding stub from an ontology. ``gm import-owl``
+reads OWL source files and emits ``ontology.yaml``. Both ``validate``
+and ``compile`` resolve a binding's companion ontology by auto-discovering
+``<name>.ontology.yaml`` next to the binding; ``--ontology PATH``
+overrides that lookup.
 
 Exit codes:
 
   0 — success
   1 — validation / compilation error
   2 — usage error (bad flag, missing file, missing companion ontology,
-      compile invoked on a non-binding file)
+      compile invoked on a non-binding file, missing dependency)
   3 — internal error
 """
 
@@ -44,14 +47,40 @@ import yaml
 from .binding_loader import load_binding
 from .binding_loader import load_binding_from_string
 from .binding_models import Binding
-from .compiler import compile_graph
-from .loader import load_ontology
-from .loader import load_ontology_from_string
+from .graph_ddl_compiler import compile_concept_index
+from .graph_ddl_compiler import compile_graph
+from .ontology_loader import load_ontology
+from .ontology_loader import load_ontology_from_string
 from .ontology_models import Ontology
+from .scaffold import scaffold
+
+
+def _default_compiler_version() -> str:
+  """Return the canonical compiler-version string for fingerprints.
+
+  Resolves the installed ``bigquery-agent-analytics`` distribution
+  version via ``importlib.metadata``. Falls back to ``"unknown"``
+  when running from a checkout that hasn't been installed (rare; the
+  fallback is deterministic so byte-identical emission still holds).
+
+  Format is ``"bigquery_ontology X.Y.Z"`` so the meta row's
+  ``compiler_version`` column is human-readable and matches the
+  pattern used in design docs and tests.
+  """
+  try:
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _pkg_version
+
+    return f"bigquery_ontology {_pkg_version('bigquery-agent-analytics')}"
+  except PackageNotFoundError:
+    return "bigquery_ontology unknown"
+  except Exception:  # pragma: no cover - defensive
+    return "bigquery_ontology unknown"
+
 
 app = typer.Typer(
     name="gm",
-    help="Graph-model CLI. Commands: validate, compile.",
+    help="Graph-model CLI. Commands: validate, compile, scaffold, import-owl.",
     add_completion=False,
     no_args_is_help=True,
 )
@@ -322,6 +351,35 @@ def compile_command(
         "--json",
         help="Emit structured JSON errors on stderr.",
     ),
+    emit_concept_index: bool = typer.Option(
+        False,
+        "--emit-concept-index",
+        help=(
+            "Also emit ``CREATE OR REPLACE TABLE`` SQL for the concept "
+            "index + ``__meta`` sibling, consumed at runtime by "
+            "``OntologyRuntime`` resolvers and verification. Requires "
+            "``--concept-index-table``."
+        ),
+    ),
+    concept_index_table: str | None = typer.Option(
+        None,
+        "--concept-index-table",
+        help=(
+            "Fully-qualified destination for the concept index, "
+            "``project.dataset.table``. Required when "
+            "``--emit-concept-index`` is set; no silent global default."
+        ),
+    ),
+    compiler_version: str | None = typer.Option(
+        None,
+        "--compiler-version",
+        help=(
+            "Override the compiler-version string flowed into the "
+            "concept index's ``compile_fingerprint``. Defaults to the "
+            "installed package version. Only honored with "
+            "``--emit-concept-index``."
+        ),
+    ),
 ) -> None:
   """Compile a binding to BigQuery ``CREATE PROPERTY GRAPH`` DDL.
 
@@ -332,6 +390,13 @@ def compile_command(
   The input must be a binding YAML file. Ontology files cannot be
   compiled on their own (they're backend-neutral; they need a
   binding to pick up physical tables and columns).
+
+  When ``--emit-concept-index`` is set, the output additionally
+  contains two ``CREATE OR REPLACE TABLE`` statements (the concept
+  index and its ``__meta`` sibling) appended after the property-graph
+  DDL. The two atomic-per-statement tables are pair-consistent via
+  a shared ``compile_fingerprint``; see
+  ``docs/entity_resolution_primitives.md`` §4.2 / §5.
   """
   file_path = Path(file)
   if not file_path.exists() or not file_path.is_file():
@@ -398,6 +463,49 @@ def compile_command(
     )
     raise typer.Exit(code=2)
 
+  # Concept-index flags must be checked before any compilation work,
+  # so we can fail fast with a clear error rather than computing DDL
+  # the caller will discard.
+  if emit_concept_index and concept_index_table is None:
+    _emit_errors(
+        [
+            {
+                "file": file,
+                "line": 0,
+                "col": 0,
+                "rule": "cli-missing-flag",
+                "severity": "error",
+                "message": (
+                    "--emit-concept-index requires --concept-index-table "
+                    "<project.dataset.table>; no silent global default."
+                ),
+            }
+        ],
+        as_json=json_output,
+    )
+    raise typer.Exit(code=2)
+  if concept_index_table is not None and not emit_concept_index:
+    # Bare ``--concept-index-table`` without the emit flag is almost
+    # certainly an authoring mistake. Surface it instead of silently
+    # ignoring the value.
+    _emit_errors(
+        [
+            {
+                "file": file,
+                "line": 0,
+                "col": 0,
+                "rule": "cli-orphan-flag",
+                "severity": "error",
+                "message": (
+                    "--concept-index-table requires --emit-concept-index; "
+                    "the flag is ignored without it."
+                ),
+            }
+        ],
+        as_json=json_output,
+    )
+    raise typer.Exit(code=2)
+
   resolved_ontology = Path(ontology_path) if ontology_path is not None else None
   ontology, binding = _load_ontology_and_binding(
       file_path, ontology_path=resolved_ontology, json_output=json_output
@@ -405,6 +513,18 @@ def compile_command(
 
   try:
     ddl = compile_graph(ontology, binding)
+    if emit_concept_index:
+      version_str = compiler_version or _default_compiler_version()
+      concept_sql = compile_concept_index(
+          ontology,
+          binding,
+          output_table=concept_index_table,  # type: ignore[arg-type]
+          compiler_version=version_str,
+      )
+      # The property-graph DDL ends with ``;\n``; append a blank line
+      # before the concept-index statements so the two sections are
+      # visually distinct.
+      ddl = ddl + "\n" + concept_sql
   except ValueError as exc:
     _emit_errors(
         _collect_errors(file, exc, kind="compile"),
@@ -436,6 +556,371 @@ def compile_command(
       raise typer.Exit(code=1)
   else:
     typer.echo(ddl, nl=False)
+
+
+# --------------------------------------------------------------------- #
+# gm scaffold                                                            #
+# --------------------------------------------------------------------- #
+
+_VALID_NAMING = {"snake", "preserve"}
+
+
+@app.command("scaffold")
+def scaffold_command(
+    ontology_path: str = typer.Option(
+        ...,
+        "--ontology",
+        help="Path to an ontology YAML file.",
+    ),
+    dataset: str = typer.Option(
+        ...,
+        "--dataset",
+        help="BigQuery dataset name for generated tables.",
+    ),
+    out: str = typer.Option(
+        ...,
+        "--out",
+        help="Output directory for table_ddl.sql and binding.yaml.",
+    ),
+    naming: str = typer.Option(
+        "snake",
+        "--naming",
+        help="Column/table naming: 'snake' (default) or 'preserve'.",
+    ),
+    project: str = typer.Option(
+        ...,
+        "--project",
+        help="BigQuery project ID.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit structured JSON errors on stderr.",
+    ),
+) -> None:
+  """Generate starter CREATE TABLE DDL and a binding stub from an ontology.
+
+  Writes ``table_ddl.sql`` and ``binding.yaml`` to the ``--out``
+  directory. The output is user-owned — edit freely after generation.
+  The generated binding is immediately valid as input to ``gm compile``.
+  """
+  if naming not in _VALID_NAMING:
+    _emit_errors(
+        [
+            {
+                "file": "<cli>",
+                "line": 0,
+                "col": 0,
+                "rule": "cli-usage",
+                "severity": "error",
+                "message": (
+                    f"Invalid --naming value {naming!r}; "
+                    f"expected one of: {', '.join(sorted(_VALID_NAMING))}."
+                ),
+            }
+        ],
+        as_json=json_output,
+    )
+    raise typer.Exit(code=2)
+
+  ont_path = Path(ontology_path)
+  if not ont_path.exists() or not ont_path.is_file():
+    _emit_errors(
+        [
+            {
+                "file": ontology_path,
+                "line": 0,
+                "col": 0,
+                "rule": "cli-missing-file",
+                "severity": "error",
+                "message": f"File not found: {ontology_path}",
+            }
+        ],
+        as_json=json_output,
+    )
+    raise typer.Exit(code=2)
+  if not os.access(ont_path, os.R_OK):
+    _emit_errors(
+        [
+            {
+                "file": ontology_path,
+                "line": 0,
+                "col": 0,
+                "rule": "cli-missing-file",
+                "severity": "error",
+                "message": f"File not readable: {ontology_path}",
+            }
+        ],
+        as_json=json_output,
+    )
+    raise typer.Exit(code=2)
+
+  out_path = Path(out)
+  if out_path.exists() and not out_path.is_dir():
+    _emit_errors(
+        [
+            {
+                "file": str(out_path),
+                "line": 0,
+                "col": 0,
+                "rule": "cli-output-error",
+                "severity": "error",
+                "message": (
+                    f"Output path exists and is not a directory: {out_path}"
+                ),
+            }
+        ],
+        as_json=json_output,
+    )
+    raise typer.Exit(code=2)
+  if out_path.is_dir() and any(out_path.iterdir()):
+    _emit_errors(
+        [
+            {
+                "file": str(out_path),
+                "line": 0,
+                "col": 0,
+                "rule": "cli-non-empty-dir",
+                "severity": "error",
+                "message": (
+                    f"Output directory is not empty: {out_path}. "
+                    "Delete or move its contents before running scaffold."
+                ),
+            }
+        ],
+        as_json=json_output,
+    )
+    raise typer.Exit(code=2)
+
+  try:
+    ontology = load_ontology(ont_path)
+  except (ValueError, ValidationError, yaml.YAMLError) as exc:
+    _emit_errors(
+        _collect_errors(ontology_path, exc, kind="ontology"),
+        as_json=json_output,
+    )
+    raise typer.Exit(code=1)
+
+  try:
+    ddl_text, binding_text = scaffold(
+        ontology, dataset=dataset, project=project, naming=naming
+    )
+  except ValueError as exc:
+    _emit_errors(
+        _collect_errors(ontology_path, exc, kind="scaffold"),
+        as_json=json_output,
+    )
+    raise typer.Exit(code=1)
+  except Exception as exc:  # pragma: no cover - defensive
+    typer.echo(f"internal error: {exc}", err=True)
+    raise typer.Exit(code=3)
+
+  try:
+    out_path.mkdir(parents=True, exist_ok=True)
+    (out_path / "table_ddl.sql").write_text(ddl_text, encoding="utf-8")
+    (out_path / "binding.yaml").write_text(binding_text, encoding="utf-8")
+  except (FileNotFoundError, PermissionError, OSError) as exc:
+    _emit_errors(
+        [
+            {
+                "file": str(out_path),
+                "line": 0,
+                "col": 0,
+                "rule": "cli-output-error",
+                "severity": "error",
+                "message": f"Cannot write to output directory: {exc}",
+            }
+        ],
+        as_json=json_output,
+    )
+    raise typer.Exit(code=1)
+
+
+# --------------------------------------------------------------------- #
+# gm import-owl                                                          #
+# --------------------------------------------------------------------- #
+
+_FORMAT_MAP = {"ttl": "turtle", "rdfxml": "xml"}
+
+
+@app.command("import-owl")
+def import_owl_command(
+    sources: list[str] = typer.Argument(
+        ...,
+        help="One or more OWL source files (Turtle or RDF/XML).",
+    ),
+    include_namespace: list[str] = typer.Option(
+        ...,
+        "--include-namespace",
+        help=(
+            "IRI namespace prefix to include. Required; repeatable. "
+            "Only classes and properties whose IRIs start with one of "
+            "these prefixes are imported."
+        ),
+    ),
+    output_path: str | None = typer.Option(
+        None,
+        "-o",
+        "--out",
+        help="Write YAML to this file instead of stdout.",
+    ),
+    format_override: str | None = typer.Option(
+        None,
+        "--format",
+        help="Override parser selection: ttl or rdfxml.",
+    ),
+    language: str = typer.Option(
+        "en",
+        "--language",
+        help=(
+            "BCP-47 language tag for label selection (default: en). "
+            "Labels in the selected language are used for names and "
+            "synonyms; labels in other languages become "
+            "language-suffixed annotations."
+        ),
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit structured JSON errors on stderr.",
+    ),
+) -> None:
+  """Import OWL sources into ontology YAML.
+
+  Reads one or more OWL files (Turtle or RDF/XML), filters by
+  namespace, and emits an ``ontology.yaml`` file. The output may
+  contain ``FILL_IN`` placeholders for ambiguities that require manual
+  resolution before ``gm validate`` will pass.
+
+  A drop summary of excluded and unsupported OWL features is always
+  printed to stderr.
+  """
+  for src in sources:
+    src_path = Path(src)
+    if not src_path.exists() or not src_path.is_file():
+      _emit_errors(
+          [
+              {
+                  "file": src,
+                  "line": 0,
+                  "col": 0,
+                  "rule": "cli-missing-file",
+                  "severity": "error",
+                  "message": f"File not found: {src}",
+              }
+          ],
+          as_json=json_output,
+      )
+      raise typer.Exit(code=2)
+    if not os.access(src_path, os.R_OK):
+      _emit_errors(
+          [
+              {
+                  "file": src,
+                  "line": 0,
+                  "col": 0,
+                  "rule": "cli-missing-file",
+                  "severity": "error",
+                  "message": f"File not readable: {src}",
+              }
+          ],
+          as_json=json_output,
+      )
+      raise typer.Exit(code=2)
+
+  rdflib_format: str | None = None
+  if format_override is not None:
+    rdflib_format = _FORMAT_MAP.get(format_override)
+    if rdflib_format is None:
+      _emit_errors(
+          [
+              {
+                  "file": "<cli>",
+                  "line": 0,
+                  "col": 0,
+                  "rule": "cli-usage",
+                  "severity": "error",
+                  "message": (
+                      f"Unknown format {format_override!r}. "
+                      "Accepted values: ttl, rdfxml."
+                  ),
+              }
+          ],
+          as_json=json_output,
+      )
+      raise typer.Exit(code=2)
+
+  try:
+    from .owl_importer import import_owl
+  except ImportError:
+    _emit_errors(
+        [
+            {
+                "file": "<cli>",
+                "line": 0,
+                "col": 0,
+                "rule": "cli-missing-dependency",
+                "severity": "error",
+                "message": (
+                    "rdflib is required for OWL import. Install it "
+                    "with: pip install 'bigquery-agent-analytics[owl]'"
+                ),
+            }
+        ],
+        as_json=json_output,
+    )
+    raise typer.Exit(code=2)
+
+  try:
+    yaml_text, drop_summary = import_owl(
+        sources,
+        include_namespaces=include_namespace,
+        format=rdflib_format,
+        language=language,
+    )
+  except ValueError as exc:
+    _emit_errors(
+        [
+            {
+                "file": sources[0] if sources else "<cli>",
+                "line": 0,
+                "col": 0,
+                "rule": "import-validation",
+                "severity": "error",
+                "message": str(exc),
+            }
+        ],
+        as_json=json_output,
+    )
+    raise typer.Exit(code=1)
+  except Exception as exc:  # pragma: no cover - defensive
+    typer.echo(f"internal error: {exc}", err=True)
+    raise typer.Exit(code=3)
+
+  if drop_summary:
+    typer.echo(drop_summary, err=True)
+
+  if output_path is not None:
+    resolved_output = Path(output_path)
+    try:
+      resolved_output.write_text(yaml_text, encoding="utf-8")
+    except OSError as exc:
+      _emit_errors(
+          [
+              {
+                  "file": str(resolved_output),
+                  "line": 0,
+                  "col": 0,
+                  "rule": "cli-output-error",
+                  "severity": "error",
+                  "message": f"Cannot write output file: {exc}",
+              }
+          ],
+          as_json=json_output,
+      )
+      raise typer.Exit(code=1)
+  else:
+    typer.echo(yaml_text, nl=False)
 
 
 def _validate_binding_file(

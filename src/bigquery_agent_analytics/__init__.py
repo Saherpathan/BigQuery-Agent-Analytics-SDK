@@ -46,6 +46,22 @@ logger = logging.getLogger("bigquery_agent_analytics." + __name__)
 
 __all__ = []
 
+# --- Telemetry primitives (always available) ---
+# Exposed as public API so operators who want SDK labels on a custom
+# bigquery.Client configuration can opt in via make_bq_client, and
+# advanced users can pass a LabeledBigQueryClient directly.
+from ._telemetry import LabeledBigQueryClient
+from ._telemetry import make_bq_client
+from ._telemetry import with_sdk_labels
+
+__all__.extend(
+    [
+        "LabeledBigQueryClient",
+        "make_bq_client",
+        "with_sdk_labels",
+    ]
+)
+
 # --- SDK Client & Core ---
 try:
   from .client import Client
@@ -354,39 +370,34 @@ except ImportError as e:
 
 # Ontology Models
 try:
-  from .ontology_models import BindingSpec
-  from .ontology_models import EntitySpec
   from .ontology_models import ExtractedEdge
   from .ontology_models import ExtractedGraph
   from .ontology_models import ExtractedNode
   from .ontology_models import ExtractedProperty
-  from .ontology_models import GraphSpec
-  from .ontology_models import KeySpec
-  from .ontology_models import load_graph_spec
-  from .ontology_models import load_graph_spec_from_string
-  from .ontology_models import PropertySpec
-  from .ontology_models import RelationshipSpec
 
   __all__.extend(
       [
-          "BindingSpec",
-          "EntitySpec",
           "ExtractedEdge",
           "ExtractedGraph",
           "ExtractedNode",
           "ExtractedProperty",
-          "GraphSpec",
-          "KeySpec",
-          "load_graph_spec",
-          "load_graph_spec_from_string",
-          "PropertySpec",
-          "RelationshipSpec",
       ]
   )
 except ImportError as e:
   logger.debug(
       "Could not import ontology model components: %s. "
       "Ensure pyyaml is installed.",
+      e,
+  )
+
+# Resolved Spec
+try:
+  from .resolved_spec import load_resolved_graph
+
+  __all__.append("load_resolved_graph")
+except ImportError as e:
+  logger.debug(
+      "Could not import resolved spec: %s.",
       e,
   )
 
@@ -435,12 +446,16 @@ except ImportError as e:
 
 # Ontology Property Graph Compiler
 try:
+  from .ontology_property_graph import can_use_upstream_compiler
+  from .ontology_property_graph import compile_ddl_via_upstream
   from .ontology_property_graph import compile_property_graph_ddl
   from .ontology_property_graph import OntologyPropertyGraphCompiler
 
   __all__.extend(
       [
           "OntologyPropertyGraphCompiler",
+          "can_use_upstream_compiler",
+          "compile_ddl_via_upstream",
           "compile_property_graph_ddl",
       ]
   )
@@ -492,15 +507,11 @@ except ImportError as e:
 
 # V5: TTL Importer
 try:
-  from .ttl_importer import ttl_import
-  from .ttl_importer import ttl_resolve
-  from .ttl_importer import TTLImportResult
+  from .ttl_importer import import_owl_to_ontology
 
   __all__.extend(
       [
-          "TTLImportResult",
-          "ttl_import",
-          "ttl_resolve",
+          "import_owl_to_ontology",
       ]
   )
 except ImportError as e:
@@ -520,6 +531,25 @@ except ImportError as e:
       e,
   )
 
+# Runtime Spec Adapter (ontology package bridge)
+try:
+  from .runtime_spec import graph_spec_to_ontology_binding
+  from .runtime_spec import LineageEdgeConfig
+  from .runtime_spec import resolved_graph_to_ontology_binding
+
+  __all__.extend(
+      [
+          "LineageEdgeConfig",
+          "graph_spec_to_ontology_binding",
+          "resolved_graph_to_ontology_binding",
+      ]
+  )
+except ImportError as e:
+  logger.debug(
+      "Could not import runtime spec adapter: %s.",
+      e,
+  )
+
 # BigFrames Evaluator (optional bigframes dependency)
 try:
   from .bigframes_evaluator import BigFramesEvaluator
@@ -529,5 +559,123 @@ except ImportError as e:
   logger.debug(
       "Could not import BigFramesEvaluator: %s. "
       "Install bigframes to use this feature.",
+      e,
+  )
+
+# Graph Validator (issue #76)
+try:
+  from .graph_validation import FallbackScope
+  from .graph_validation import validate_extracted_graph
+  from .graph_validation import validate_extracted_graph_from_ontology
+  from .graph_validation import ValidationFailure
+  from .graph_validation import ValidationReport
+
+  __all__.extend(
+      [
+          "FallbackScope",
+          "ValidationFailure",
+          "ValidationReport",
+          "validate_extracted_graph",
+          "validate_extracted_graph_from_ontology",
+      ]
+  )
+except ImportError as e:
+  logger.debug(
+      "Could not import graph validator: %s.",
+      e,
+  )
+
+# Extractor compilation scaffolding (issue #75 PR 4b.1)
+try:
+  from .extractor_compilation import AstFailure
+  from .extractor_compilation import AstReport
+  from .extractor_compilation import AttemptRecord
+  from .extractor_compilation import build_ast_diagnostic
+  from .extractor_compilation import build_compile_result_diagnostic
+  from .extractor_compilation import build_gate_diagnostic
+  from .extractor_compilation import build_plan_parse_diagnostic
+  from .extractor_compilation import build_resolution_prompt
+  from .extractor_compilation import build_retry_prompt
+  from .extractor_compilation import build_runtime_extractor_registry
+  from .extractor_compilation import build_smoke_diagnostic
+  from .extractor_compilation import compile_extractor
+  from .extractor_compilation import compile_with_llm
+  from .extractor_compilation import CompileMeasurement
+  from .extractor_compilation import CompileResult
+  from .extractor_compilation import CompileSource
+  from .extractor_compilation import compute_fingerprint
+  from .extractor_compilation import discover_bundles
+  from .extractor_compilation import DiscoveryResult
+  from .extractor_compilation import FallbackOutcome
+  from .extractor_compilation import FieldMapping
+  from .extractor_compilation import LLMClient
+  from .extractor_compilation import load_bundle
+  from .extractor_compilation import LoadedBundle
+  from .extractor_compilation import LoadFailure
+  from .extractor_compilation import Manifest
+  from .extractor_compilation import measure_compile
+  from .extractor_compilation import OutcomeCallback
+  from .extractor_compilation import parse_resolved_extractor_plan_json
+  from .extractor_compilation import PlanParseError
+  from .extractor_compilation import PlanResolver
+  from .extractor_compilation import render_extractor_source
+  from .extractor_compilation import RESOLVED_EXTRACTOR_PLAN_JSON_SCHEMA
+  from .extractor_compilation import ResolvedExtractorPlan
+  from .extractor_compilation import RetryCompileResult
+  from .extractor_compilation import run_smoke_test
+  from .extractor_compilation import run_with_fallback
+  from .extractor_compilation import SmokeTestReport
+  from .extractor_compilation import SpanHandlingRule
+  from .extractor_compilation import validate_source
+  from .extractor_compilation import WrappedRegistry
+
+  __all__.extend(
+      [
+          "AstFailure",
+          "AstReport",
+          "AttemptRecord",
+          "CompileMeasurement",
+          "CompileResult",
+          "CompileSource",
+          "DiscoveryResult",
+          "FallbackOutcome",
+          "FieldMapping",
+          "LoadFailure",
+          "LoadedBundle",
+          "OutcomeCallback",
+          "WrappedRegistry",
+          "LLMClient",
+          "Manifest",
+          "PlanParseError",
+          "PlanResolver",
+          "RESOLVED_EXTRACTOR_PLAN_JSON_SCHEMA",
+          "ResolvedExtractorPlan",
+          "RetryCompileResult",
+          "SmokeTestReport",
+          "SpanHandlingRule",
+          "build_ast_diagnostic",
+          "build_compile_result_diagnostic",
+          "build_gate_diagnostic",
+          "build_plan_parse_diagnostic",
+          "build_resolution_prompt",
+          "build_retry_prompt",
+          "build_smoke_diagnostic",
+          "compile_extractor",
+          "compile_with_llm",
+          "compute_fingerprint",
+          "discover_bundles",
+          "load_bundle",
+          "measure_compile",
+          "parse_resolved_extractor_plan_json",
+          "build_runtime_extractor_registry",
+          "render_extractor_source",
+          "run_smoke_test",
+          "run_with_fallback",
+          "validate_source",
+      ]
+  )
+except ImportError as e:
+  logger.debug(
+      "Could not import extractor compilation scaffolding: %s.",
       e,
   )

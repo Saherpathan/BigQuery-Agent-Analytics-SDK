@@ -148,8 +148,35 @@ gm compile <binding> [--ontology <path>] [-o <out>]
 | `-o <file>`, `--output <file>` | Write DDL to file instead of stdout. |
 | `--ontology <path>` | Path to the companion ontology. Overrides auto-discovery (same as `gm validate`). |
 | `--json` | Structured errors for the implicit validation step. |
+| `--emit-concept-index` | Append `CREATE OR REPLACE TABLE` SQL for the concept index + `__meta` sibling. Requires `--concept-index-table`. See [`concept-index.md`](concept-index.md). |
+| `--concept-index-table <project.dataset.table>` | Fully-qualified destination for the concept index. Required when `--emit-concept-index` is set; no silent global default. The `__meta` sibling is suffixed automatically. |
+| `--compiler-version <str>` | Override the version string flowed into `compile_fingerprint`. Defaults to the installed package version. Only honored with `--emit-concept-index`. |
 
 On any validation or compilation error, no DDL is emitted — even partially.
+
+### Concept-index extension
+
+When `--emit-concept-index` is set, the output combines the property-graph
+DDL with two `CREATE OR REPLACE TABLE` statements emitted by the
+sibling `compile_concept_index` emitter (the main concept index and its
+`__meta` provenance table). The combined output is still a single text
+stream; pipe it into `bq query` or write it to a file with `-o`. Without
+the flag, output is byte-identical to plain `gm compile`.
+
+The required `--concept-index-table` value must be a fully-qualified
+`project.dataset.table` triple. Each segment must match
+`^[A-Za-z0-9_-]+$`; backticks are added by the emitter (do not
+pre-quote). See [`concept-index.md`](concept-index.md) for the full
+schema, provenance contract, and SQL patterns.
+
+Example:
+
+```bash
+gm compile finance-bq-prod.binding.yaml \
+  --emit-concept-index \
+  --concept-index-table my-proj.my_ds.ontology_concept_index \
+  -o graph_ddl.sql
+```
 
 ### Filename convention
 
@@ -166,10 +193,15 @@ Read OWL sources and emit a `*.ontology.yaml` (see `owl-import.md`).
 
 ```
 gm import-owl <source>... --include-namespace <iri>... [-o <out>]
+              [--format ttl|rdfxml] [--language <tag>] [--json]
 ```
 
 - One or more OWL source files (Turtle, RDF/XML).
 - At least one `--include-namespace` required; multiple allowed.
+- Recognizes both OWL and SKOS constructs; SKOS concepts become
+  abstract entities, SKOS graph predicates become abstract
+  relationships, and SKOS literals become annotations. See
+  `owl-import.md` §19 for the full mapping.
 - Output uses `FILL_IN` for ambiguities and annotations for dropped OWL
   features (see `owl-import.md` §11, §13). `FILL_IN` causes
   `gm validate` to fail until resolved.
@@ -181,9 +213,14 @@ gm import-owl <source>... --include-namespace <iri>... [-o <out>]
 | `--include-namespace <iri>` | Required, repeatable. |
 | `-o <file>`, `--out <file>` | Write YAML to file instead of stdout. |
 | `--format ttl\|rdfxml` | Override parser selection from file extension. |
+| `--language <tag>` | BCP-47 language tag for label selection (default `en`). Other-language labels become language-suffixed annotations. |
 | `--json` | Structured drop-and-placeholder summary. |
 
-Drop summary is printed to stderr regardless of `--json`.
+Drop summary is printed to stderr regardless of `--json`. It includes
+SKOS counts (concepts imported as abstract, relationships imported as
+abstract, annotations preserved, labels discarded by language
+selection, external match targets, generic literal annotations) and a
+hint when every imported entity is abstract.
 
 ## 7. Open questions
 

@@ -50,8 +50,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from .ontology_models import GraphSpec
-from .ontology_models import load_graph_spec
+from .resolved_spec import ResolvedGraph
 
 logger = logging.getLogger("bigquery_agent_analytics." + __name__)
 
@@ -84,7 +83,7 @@ LIMIT @result_limit
 
 
 def compile_showcase_gql(
-    spec: GraphSpec,
+    spec: ResolvedGraph,
     project_id: str,
     dataset_id: str,
     graph_name: Optional[str] = None,
@@ -158,14 +157,14 @@ def compile_showcase_gql(
   # destination PKs + properties.
   return_cols = []
   for prop in src_entity.properties:
-    return_cols.append(f"{src_alias}.{prop.name} AS src_{prop.name}")
+    return_cols.append(f"{src_alias}.{prop.column} AS src_{prop.column}")
   for prop in rel.properties:
-    return_cols.append(f"{edge_alias}.{prop.name}")
+    return_cols.append(f"{edge_alias}.{prop.column}")
   for prop in dst_entity.properties:
-    return_cols.append(f"{dst_alias}.{prop.name} AS dst_{prop.name}")
+    return_cols.append(f"{dst_alias}.{prop.column} AS dst_{prop.column}")
 
   # Order by the source entity's first primary key.
-  order_column = f"{src_alias}.{src_entity.keys.primary[0]}"
+  order_column = f"{src_alias}.{src_entity.key_columns[0]}"
 
   return _SHOWCASE_GQL_TEMPLATE.format(
       graph_ref=graph_ref,
@@ -182,7 +181,7 @@ def compile_showcase_gql(
 
 
 def compile_lineage_gql(
-    spec: GraphSpec,
+    spec: ResolvedGraph,
     project_id: str,
     dataset_id: str,
     relationship_name: str,
@@ -241,11 +240,13 @@ def compile_lineage_gql(
 
   return_cols = []
   for prop in entity.properties:
-    return_cols.append(f"{prior_alias}.{prop.name} AS prior_{prop.name}")
+    return_cols.append(f"{prior_alias}.{prop.column} AS prior_{prop.column}")
   for prop in rel.properties:
-    return_cols.append(f"{edge_alias}.{prop.name}")
+    return_cols.append(f"{edge_alias}.{prop.column}")
   for prop in entity.properties:
-    return_cols.append(f"{current_alias}.{prop.name} AS current_{prop.name}")
+    return_cols.append(
+        f"{current_alias}.{prop.column} AS current_{prop.column}"
+    )
 
   return _LINEAGE_GQL_TEMPLATE.format(
       graph_ref=graph_ref,
@@ -289,47 +290,70 @@ def _short_alias(name: str, prefix: str = "") -> str:
 
 def build_ontology_graph(
     session_ids: list[str],
-    spec_path: str,
     project_id: str,
     dataset_id: str,
+    spec_path: str | None = None,
+    spec: ResolvedGraph | None = None,
     env: Optional[str] = None,
     graph_name: Optional[str] = None,
     table_id: str = "agent_events",
     endpoint: str = "gemini-2.5-flash",
     use_ai_generate: bool = True,
     location: Optional[str] = None,
+    skip_property_graph: bool = False,
 ) -> dict[str, Any]:
   """Run the full ontology graph pipeline end-to-end.
 
-  1. Load the YAML spec.
+  1. Load the YAML spec (or use pre-loaded ``spec``).
   2. Extract an ``ExtractedGraph`` from agent telemetry.
   3. Create physical tables (if not exists).
   4. Materialize extracted nodes/edges into tables.
-  5. Create the BigQuery Property Graph.
+  5. Create the BigQuery Property Graph (skipped when
+     ``skip_property_graph=True``).
 
   Args:
       session_ids: Sessions to extract from.
-      spec_path: Path to the YAML graph spec.
       project_id: GCP project ID.
       dataset_id: BigQuery dataset ID.
+      spec_path: [Deprecated] Path to the YAML graph spec. Use
+          ``spec`` instead.
+      spec: A pre-loaded ``ResolvedGraph``. Preferred over
+          ``spec_path``.
       env: Value for ``{{ env }}`` placeholder substitution.
       graph_name: Override the property graph name.
       table_id: Source telemetry table name.
       endpoint: AI.GENERATE model endpoint.
       use_ai_generate: If True, uses server-side AI extraction.
       location: BigQuery location.
+      skip_property_graph: When True, skip phase 5 (do not run
+          ``CREATE OR REPLACE PROPERTY GRAPH``). Use this when the
+          caller owns their own property-graph DDL and only wants
+          the SDK to populate base tables. The result dict reports
+          ``property_graph_created=False`` with
+          ``skipped_reason="user_requested"`` and
+          ``property_graph_status="skipped:user_requested"``, which
+          callers (and the CLI) use to distinguish a deliberate
+          skip from a creation failure.
 
   Returns:
       A dict with keys: ``spec``, ``graph``, ``tables_created``,
       ``rows_materialized``, ``property_graph_created``,
+      ``property_graph_status`` (one of ``"created"``, ``"failed"``,
+      ``"skipped:user_requested"``), ``skipped_reason`` (only set
+      when phase 5 was skipped, e.g. ``"user_requested"``),
       ``graph_name``, ``graph_ref``.
   """
   from .ontology_graph import OntologyGraphManager
   from .ontology_materializer import OntologyMaterializer
   from .ontology_property_graph import OntologyPropertyGraphCompiler
 
-  # 1. Load spec.
-  spec = load_graph_spec(spec_path, env=env)
+  # 1. Load spec (or use pre-loaded ResolvedGraph).
+  if spec is None:
+    if spec_path is None:
+      raise ValueError("Either spec or spec_path is required.")
+    from .resolved_spec import load_resolved_graph
+
+    spec = load_resolved_graph(spec_path, env=env)
   name = graph_name or spec.name
   logger.info(
       "Loaded spec %r with %d entities, %d relationships.",
@@ -381,24 +405,36 @@ def build_ontology_graph(
   rows_materialized = materializer.materialize(graph, session_ids)
   logger.info("Rows materialized: %s", rows_materialized)
 
-  # 5. Create property graph.
-  compiler = OntologyPropertyGraphCompiler(
-      project_id=project_id,
-      dataset_id=dataset_id,
-      spec=spec,
-      location=location,
-  )
-  pg_created = compiler.create_property_graph(graph_name=name)
-
   graph_ref = f"{project_id}.{dataset_id}.{name}"
-  logger.info("Property Graph %r created=%s.", graph_ref, pg_created)
 
-  return {
+  # 5. Create property graph (or skip when caller owns the DDL).
+  result: dict[str, Any] = {
       "spec": spec,
       "graph": graph,
       "tables_created": tables_created,
       "rows_materialized": rows_materialized,
-      "property_graph_created": pg_created,
       "graph_name": name,
       "graph_ref": graph_ref,
   }
+  if skip_property_graph:
+    logger.info(
+        "Property Graph creation skipped (skip_property_graph=True); "
+        "caller owns the DDL for graph %r.",
+        graph_ref,
+    )
+    result["property_graph_created"] = False
+    result["skipped_reason"] = "user_requested"
+    result["property_graph_status"] = "skipped:user_requested"
+  else:
+    compiler = OntologyPropertyGraphCompiler(
+        project_id=project_id,
+        dataset_id=dataset_id,
+        spec=spec,
+        location=location,
+    )
+    pg_created = compiler.create_property_graph(graph_name=name)
+    logger.info("Property Graph %r created=%s.", graph_ref, pg_created)
+    result["property_graph_created"] = pg_created
+    result["property_graph_status"] = "created" if pg_created else "failed"
+
+  return result
