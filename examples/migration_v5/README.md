@@ -11,7 +11,7 @@ The pipeline takes a single :class:`ontology_artifacts.OntologyConfig` plus a ta
 | Generated file | What it is |
 |---|---|
 | `ontology.yaml` | `import-owl` output with `FILL_IN` PKs resolved, cross-namespace dangling relationships dropped, inheritance stripped. |
-| `binding.yaml` | Maps the configured entity allowlist onto BigQuery tables for the target `(project, dataset)`. Heterogeneous edges only; self-edges and out-of-scope relationships filtered. |
+| `binding.yaml` | Maps the configured entity allowlist onto BigQuery tables for the target `(project, dataset)`. Heterogeneous edges use the legacy `from_columns: [<col>]` shape; self-edges (`evolvedFrom`, `supersededBy`) use the explicit dict-shape `from_columns: [{src_<col>: <pk_prop>}]` so the SDK's canonical FK→PK mapping disambiguates the src/dst endpoints. Out-of-scope relationships filtered. |
 | `table_ddl.sql` | `CREATE TABLE` SQL for every node + edge table, with SDK metadata columns (`session_id STRING, extracted_at TIMESTAMP`) on every bound table. |
 | `property_graph.sql` | `CREATE OR REPLACE PROPERTY GRAPH` over those tables. Node `KEY` + edge `SOURCE KEY ... REFERENCES` use the per-entity PK columns. |
 
@@ -85,7 +85,7 @@ The decisions below are documented in MAKO terms because MAKO is the load-bearin
 
 The MAKO demo entity allowlist (`DEMO_ENTITIES` in `mako_artifacts.py`) is six entities: `AgentSession`, `DecisionExecution`, `DecisionPoint`, `Candidate`, `SelectionOutcome`, `ContextSnapshot`. `DecisionExecution` is non-obvious but load-bearing — per MAKO's TTL, it's the entity that's `partOfSession` an `AgentSession`, `atContextSnapshot` a `ContextSnapshot`, `executedAtDecisionPoint` a `DecisionPoint`, `hasSelectionOutcome` a `SelectionOutcome`. The decision-flow story doesn't hold together without it.
 
-The edge set is **TTL-driven with two filters**: `make_binding` walks `ontology.relationships` and picks every relationship whose endpoints both fall within the entity allowlist *and* which is not a self-edge. The current MAKO binding has **seven** real relationships (`atContextSnapshot`, `evaluatesCandidate`, `executedAtDecisionPoint`, `hasSelectionOutcome`, `partOfSession`, `rejectedCandidate`, `selectedCandidate`). MAKO's two self-edges (`evolvedFrom`, `supersededBy`, both DecisionExecution → DecisionExecution) are documented under design decision 9 below.
+The edge set is **TTL-driven with one filter**: `make_binding` walks `ontology.relationships` and picks every relationship whose endpoints both fall within the entity allowlist. The current MAKO binding has **nine** relationships — seven heterogeneous (`atContextSnapshot`, `evaluatesCandidate`, `executedAtDecisionPoint`, `hasSelectionOutcome`, `partOfSession`, `rejectedCandidate`, `selectedCandidate`) plus two `DecisionExecution → DecisionExecution` self-edges (`evolvedFrom`, `supersededBy`). The self-edges use the explicit dict-shape `from_columns` introduced in #179 and consumed by C2; see design decision 9 below for the column convention.
 
 ### 2. FILL_IN resolution: synthesize `id: string`
 
@@ -141,15 +141,26 @@ The exporter's `SELECT` projects the subset of the BQ AA plugin's schema the not
 
 ### 8. Per-entity PK columns
 
-Every entity's PK column is `{entity_short}_id` (`decision_execution_id`, `candidate_id`, `agent_session_id`, …), not a bare `id`. The materializer's `_relationship_columns` (`ontology_materializer.py`) looks up edge FK columns in `src_prop_map[col].sdk_type` — that lookup requires the FK column to *exactly* name a column on the source entity. With bare `id`, every cross-entity edge would land `(id STRING, id STRING)` (duplicate-column error) and the FK→PK type lookup would still miss. Per-entity names match the convention the original V5 spec used (`YMGO_Context_Graph_V3`: `decision_id`, `adUnitId`) and the SDK's integration-test fixture. **General behavior**: applies to every config; the Simple Request Flow binding produces `request_id` / `action_id` / `outcome_id` for the same reason.
+Every entity's PK column is `{entity_short}_id` (`decision_execution_id`, `candidate_id`, `agent_session_id`, …), not a bare `id`. Even after C2 wired the canonical FK→PK mapping (so the materializer can resolve self-edges where `src_<col>_id` deliberately differs from the PK column), heterogeneous edges keep the legacy `list[str]` shape — and that shape pairs binding columns positionally with the endpoint's PK columns. With bare `id` as the PK, every cross-entity edge would land `(id STRING, id STRING)` (duplicate-column error) and the heterogeneous-edge codepath would have no way to disambiguate without forcing every binding into dict-shape. Per-entity names match the convention the original V5 spec used (`YMGO_Context_Graph_V3`: `decision_id`, `adUnitId`) and the SDK's integration-test fixture. **General behavior**: applies to every config; the Simple Request Flow binding produces `request_id` / `action_id` / `outcome_id` for the same reason.
 
 Notebook GQL queries reference `de.decision_execution_id` (not `de.id`); the Beat 4 cells carry an entity → PK column map for the same reason.
 
-### 9. Self-edges dropped from the binding
+### 9. Self-edges via explicit FK→PK mapping
 
-MAKO declares `evolvedFrom` and `supersededBy` as `DecisionExecution → DecisionExecution` self-edges. The materializer's FK→PK lookup can't disambiguate the two endpoints from a single source entity, and the natural composite key `(decision_execution_id, decision_execution_id)` is a duplicate-column error. `src_/dst_` prefixing avoids the duplicate but still misses the materializer's property-column lookup.
+MAKO declares `evolvedFrom` and `supersededBy` as `DecisionExecution → DecisionExecution` self-edges. The natural composite `(decision_execution_id, decision_execution_id)` is a duplicate-column error, and bare `src_/dst_` prefixing on its own misses the materializer's property-column lookup (the FK column no longer matches any property name on the endpoint entity).
 
-The ontology still declares both edges (the TTL is unchanged); the binding scope drops them. A future binding revision could re-add self-edges if the SDK accepts FK-to-PK column mapping or the materializer learns to handle them via per-endpoint prefixes; for now the seven heterogeneous edges carry the decision-flow narrative end-to-end. **General behavior**: any config's binding drops self-edges with the same rationale.
+C2 (`feat/relationship-canonical-column-mapping`) wires the canonical FK→PK mapping from #179 through the materializer, the validator, and the PG DDL compiler — so the binding can declare self-edges using the dict-shape `from_columns`:
+
+```yaml
+- name: evolvedFrom
+  source: <project>.<dataset>.evolved_from
+  from_columns:
+  - src_decision_execution_id: id     # edge_col -> endpoint PK property
+  to_columns:
+  - dst_decision_execution_id: id
+```
+
+`make_binding()` emits this shape for any `rel.from_ == rel.to`. The materializer's `_route_edge` uses the canonical `from_column_mapping` / `to_column_mapping` to translate the parsed node-id segment (keyed by endpoint *column*) into the right edge-table FK column. The PG DDL compiler resolves `SOURCE KEY (src_decision_execution_id) REFERENCES decision_execution (decision_execution_id)` correctly. **General behavior**: applies to any config — self-edges are no longer dropped.
 
 ### 10. Inheritance stripped from entities
 
