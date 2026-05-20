@@ -67,6 +67,21 @@ Env vars (all set by the deploy script via
   folded into the state-key SHA so a backfill / re-extraction
   run writes its state rows in a distinct namespace from the
   steady-state cron. Recommended whenever ``BQAA_BACKFILL=true``.
+* ``BQAA_EXTRACTION_MODE`` (default ``ai-fallback``) — one of
+  ``ai-fallback`` or ``compiled-only``. ``ai-fallback`` keeps the
+  existing behavior (structured extractors + AI.GENERATE for
+  gaps). ``compiled-only`` skips ``AI.GENERATE`` entirely; any
+  span the compiled extractors don't cover surfaces as a typed
+  ``empty_extraction`` failure with sample diagnostics. The SDK
+  surface for ``compiled-only`` is fully supported, but
+  ``deploy_cloud_run_job.sh`` rejects it today because that script
+  does not yet stage bundles / a reference extractor module into
+  the Cloud Run image — a follow-up PR will wire the bundles and
+  lift the deploy reject (and make the
+  ``roles/aiplatform.user`` grant conditional). Until then,
+  customers who want compiled-only build their own Cloud Run
+  image and set ``BQAA_BUNDLES_ROOT`` /
+  ``BQAA_REFERENCE_EXTRACTORS_MODULE`` themselves.
 
 Exit codes mirror the CLI:
 
@@ -347,6 +362,13 @@ def main() -> int:
   from_time_raw = os.environ.get("BQAA_FROM") or None
   to_time_raw = os.environ.get("BQAA_TO") or None
   state_key_suffix = os.environ.get("BQAA_STATE_KEY_SUFFIX") or None
+  # Default ``ai-fallback`` keeps the legacy extract_graph(...,
+  # use_ai_generate=True) path; ``compiled-only`` opts into B1's
+  # diagnostics-emitting path with no AI calls. The materializer's
+  # own validator rejects any other value at the boundary.
+  extraction_mode = (
+      os.environ.get("BQAA_EXTRACTION_MODE") or "ai-fallback"
+  ).strip()
 
   _emit(
       "INFO",
@@ -362,6 +384,7 @@ def main() -> int:
       from_time=from_time_raw,
       to_time=to_time_raw,
       state_key_suffix=state_key_suffix,
+      extraction_mode=extraction_mode,
   )
 
   try:
@@ -434,6 +457,7 @@ def main() -> int:
         from_time=parsed_from,
         to_time=parsed_to,
         state_key_suffix=state_key_suffix,
+        extraction_mode=extraction_mode,
     )
 
     # Structured JSON report for Cloud Logging. Cloud Logging

@@ -91,6 +91,7 @@ OVERLAP_MINUTES="15"
 MAX_SESSIONS=""
 JOB_NAME="bqaa-periodic-materialization"
 SMOKE=false
+EXTRACTION_MODE="ai-fallback"
 
 # Print usage. Exit code is the caller's choice: ``usage 0``
 # for ``--help`` (success), ``usage 1`` for parse / required-arg
@@ -116,6 +117,17 @@ Optional:
   --job-name NAME              Cloud Run Job name
                                (default: bqaa-periodic-materialization).
   --smoke                      After deploy, run the job once + tail logs.
+  --extraction-mode MODE       'ai-fallback' (default; only supported value
+                               on this deploy path today). The SDK also
+                               supports 'compiled-only' (structured
+                               extractors only, no AI.GENERATE) — accessible
+                               via the CLI when the caller wires bundles
+                               themselves — but this deploy script does
+                               not yet stage compiled-bundle artifacts into
+                               the Cloud Run image, so 'compiled-only' is
+                               rejected here. A follow-up PR will wire
+                               bundles + reference extractor into the
+                               deploy artifact.
   -h | --help                  Show this help.
 EOF
   exit "${1:-1}"
@@ -152,6 +164,7 @@ while [[ $# -gt 0 ]]; do
     --max-sessions)    require_arg "$1" "${2-}"; MAX_SESSIONS="$2"; shift 2 ;;
     --job-name)        require_arg "$1" "${2-}"; JOB_NAME="$2"; shift 2 ;;
     --smoke)           SMOKE=true; shift ;;
+    --extraction-mode) require_arg "$1" "${2-}"; EXTRACTION_MODE="$2"; shift 2 ;;
     -h|--help)         usage 0 ;;
     *)                 echo "Unknown argument: $1" >&2; usage 1 ;;
   esac
@@ -168,6 +181,61 @@ for var in PROJECT REGION EVENTS_DATASET GRAPH_DATASET SCHEDULE; do
     exit 1
   fi
 done
+
+# Validate ``--extraction-mode`` at the boundary. The materializer
+# rejects unknown values too, but failing here means an operator
+# typo (e.g. ``compiled_only`` with an underscore) doesn't spend
+# 3 minutes on a Cloud Build before raising.
+#
+# ``compiled-only`` is intentionally REJECTED at the deploy
+# boundary even though the SDK supports it. Reason: this deploy
+# script does not yet wire ``BQAA_BUNDLES_ROOT`` /
+# ``BQAA_REFERENCE_EXTRACTORS_MODULE`` into the Cloud Run image,
+# so a deployed compiled-only run would silently skip both
+# AI.GENERATE and the structured extractors — producing empty
+# graphs with no diagnostic surface instead of the typed
+# "compiled extractors didn't cover this span" failure the SDK's
+# compiled-only mode advertises. Lifting this restriction needs a
+# follow-up PR that vendors the bundles + the reference extractor
+# into the deploy artifact and threads them as env vars. Until
+# then, customers who want compiled-only run ``bqaa-materialize-
+# window --extraction-mode=compiled-only --bundles-root ...
+# --reference-extractors-module ...`` directly (e.g., from a
+# custom Cloud Run image they build themselves).
+case "$EXTRACTION_MODE" in
+  ai-fallback) ;;
+  compiled-only)
+    cat >&2 <<'COMPILED_ONLY_NOT_READY'
+Error: --extraction-mode=compiled-only is not yet supported on the
+Cloud Run deploy path.
+
+The SDK accepts compiled-only mode (and the test suite proves it
+makes zero AI.GENERATE calls), but this deploy script does not yet
+stage the compiled extractor bundles / reference extractor module
+into the Cloud Run image. Running compiled-only here would skip
+both AI.GENERATE *and* the structured extractors and produce
+empty graphs with no diagnostic surface — a worse failure mode
+than the ai-fallback default.
+
+Until a follow-up PR wires bundles + reference extractor into the
+deploy artifact, use one of:
+
+  * --extraction-mode=ai-fallback  (the default; existing behavior)
+  * Run the CLI directly from a Cloud Run image you build, with
+    your own bundles wired:
+        bqaa-materialize-window \
+            --extraction-mode=compiled-only \
+            --bundles-root /path/to/bundles \
+            --reference-extractors-module your.reference.module \
+            ...
+COMPILED_ONLY_NOT_READY
+    exit 1
+    ;;
+  *)
+    echo "Error: --extraction-mode must be 'ai-fallback'; got '$EXTRACTION_MODE'." >&2
+    exit 1
+    ;;
+esac
 
 SCHEDULER_NAME="${JOB_NAME}-cron"
 
@@ -335,6 +403,17 @@ _retry_iam gcloud projects add-iam-policy-binding "$PROJECT" \
 # checking ``rows_materialized``). The verification round in
 # #166 surfaced this — the deploy looks ``ok=true`` but the
 # entity tables stay empty.
+# ``roles/aiplatform.user`` is always granted on the deploy path
+# because this script only accepts ``--extraction-mode=ai-fallback``
+# (see the validator above; ``compiled-only`` is rejected until
+# bundles wiring lands). A follow-up PR that wires bundles into the
+# deploy image will revisit this grant to make it conditional on
+# ``--extraction-mode``: in compiled-only mode the SDK is already
+# proven (by ``TestCompiledOnlyMakesZeroLLMCalls``) to make zero
+# AI.GENERATE calls, so the role becomes safe to drop and the
+# script can both skip the add and ``remove-iam-policy-binding``
+# any pre-existing grant on the same SA (relevant when a customer
+# transitions an ai-fallback deploy to compiled-only).
 echo "==> granting project-level roles/aiplatform.user to $SA_EMAIL"
 _retry_iam gcloud projects add-iam-policy-binding "$PROJECT" \
   --member "serviceAccount:${SA_EMAIL}" \
@@ -474,6 +553,7 @@ ENV_VARS=(
   "BQAA_LOCATION=${BQ_LOCATION}"
   "BQAA_LOOKBACK_HOURS=${LOOKBACK_HOURS}"
   "BQAA_OVERLAP_MINUTES=${OVERLAP_MINUTES}"
+  "BQAA_EXTRACTION_MODE=${EXTRACTION_MODE}"
 )
 if [[ -n "${MAX_SESSIONS}" ]]; then
   ENV_VARS+=("BQAA_MAX_SESSIONS=${MAX_SESSIONS}")
