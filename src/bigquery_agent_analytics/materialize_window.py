@@ -819,6 +819,31 @@ def run_materialize_window(
         f"{sorted(_VALID_EXTRACTION_MODES)!r}; got {extraction_mode!r}."
     )
 
+  # Compiled-only requires an extractor source. Without one,
+  # ``_build_manager`` would take the legacy no-extractors path and
+  # ``extract_graph(..., run_structured=True, use_ai_generate=False,
+  # on_unhandled_span='fail')`` would emit an empty graph with no
+  # diagnostics — defeating the typed ``empty_extraction`` failure
+  # surface compiled-only mode is supposed to guarantee. Catch the
+  # silent-empty failure mode at the boundary, before any BigQuery
+  # work runs.
+  if (
+      extraction_mode == EXTRACTION_MODE_COMPILED_ONLY
+      and bundles_root is None
+      and reference_extractors_module is None
+  ):
+    raise ValueError(
+        "--extraction-mode=compiled-only requires either "
+        "--bundles-root or --reference-extractors-module (or both). "
+        "Neither is set, so the orchestrator would build a manager "
+        "with no structured extractors and silently emit empty "
+        "graphs for every session. Pass --reference-extractors-module "
+        "for the simple reference-only path (e.g. "
+        "--reference-extractors-module=reference_extractor on the "
+        "migration v5 demo), or pre-compile bundles and pass "
+        "--bundles-root alongside --reference-extractors-module."
+    )
+
   # Numeric guardrails — reject nonsense at the boundary so the
   # orchestrator's downstream arithmetic (timedeltas, LIMIT clauses)
   # never produces a "scan into the future" or an unbounded loop.
@@ -1534,6 +1559,31 @@ def _build_manager(
   from .ontology_graph import OntologyGraphManager
 
   if bundles_root is None:
+    # Two sub-paths when no compiled-bundle directory is configured:
+    #
+    # 1. ``reference_extractors_module`` is also unset — legacy
+    #    AI-only path. The manager has no structured extractors;
+    #    ``extract_graph`` falls through to ``AI.GENERATE``.
+    # 2. ``reference_extractors_module`` IS set — reference-only
+    #    path (added for the compiled-only deploy follow-up). The
+    #    reference module's ``EXTRACTORS`` dict goes straight into
+    #    the manager's extractor registry. Equivalent to compiled-
+    #    bundle mode for the customer's purposes — same handlers,
+    #    same diagnostic surface — without the offline bundle-
+    #    compilation step. Customers who want fingerprint-stable
+    #    compiled bundles still get that path by also setting
+    #    ``bundles_root``.
+    extractors = None
+    if reference_extractors_module is not None:
+      import importlib
+
+      ref_module = importlib.import_module(reference_extractors_module)
+      extractors = getattr(ref_module, "EXTRACTORS", None)
+      if not isinstance(extractors, dict) or not extractors:
+        raise ValueError(
+            f"reference module {reference_extractors_module!r} must expose "
+            f"a non-empty EXTRACTORS dict"
+        )
     return OntologyGraphManager.from_ontology_binding(
         project_id=project_id,
         dataset_id=dataset_id,
@@ -1542,6 +1592,7 @@ def _build_manager(
         location=location,
         bq_client=bq_client,
         table_id=table_id,
+        extractors=extractors,
     )
 
   if reference_extractors_module is None:

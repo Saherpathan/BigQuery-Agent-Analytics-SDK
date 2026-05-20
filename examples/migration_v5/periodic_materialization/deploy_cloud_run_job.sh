@@ -117,17 +117,17 @@ Optional:
   --job-name NAME              Cloud Run Job name
                                (default: bqaa-periodic-materialization).
   --smoke                      After deploy, run the job once + tail logs.
-  --extraction-mode MODE       'ai-fallback' (default; only supported value
-                               on this deploy path today). The SDK also
-                               supports 'compiled-only' (structured
-                               extractors only, no AI.GENERATE) — accessible
-                               via the CLI when the caller wires bundles
-                               themselves — but this deploy script does
-                               not yet stage compiled-bundle artifacts into
-                               the Cloud Run image, so 'compiled-only' is
-                               rejected here. A follow-up PR will wire
-                               bundles + reference extractor into the
-                               deploy artifact.
+  --extraction-mode MODE       'ai-fallback' (default) or 'compiled-only'.
+                               'ai-fallback' runs structured extractors
+                               with AI.GENERATE for any uncovered span.
+                               'compiled-only' runs structured extractors
+                               only, never calls AI.GENERATE, and surfaces
+                               uncovered spans as typed empty_extraction
+                               failures with sample diagnostics. In
+                               compiled-only mode the deploy skips the
+                               roles/aiplatform.user grant and idempotently
+                               removes any pre-existing grant from a prior
+                               ai-fallback deploy of the same SA.
   -h | --help                  Show this help.
 EOF
   exit "${1:-1}"
@@ -187,52 +187,15 @@ done
 # typo (e.g. ``compiled_only`` with an underscore) doesn't spend
 # 3 minutes on a Cloud Build before raising.
 #
-# ``compiled-only`` is intentionally REJECTED at the deploy
-# boundary even though the SDK supports it. Reason: this deploy
-# script does not yet wire ``BQAA_BUNDLES_ROOT`` /
-# ``BQAA_REFERENCE_EXTRACTORS_MODULE`` into the Cloud Run image,
-# so a deployed compiled-only run would silently skip both
-# AI.GENERATE and the structured extractors — producing empty
-# graphs with no diagnostic surface instead of the typed
-# "compiled extractors didn't cover this span" failure the SDK's
-# compiled-only mode advertises. Lifting this restriction needs a
-# follow-up PR that vendors the bundles + the reference extractor
-# into the deploy artifact and threads them as env vars. Until
-# then, customers who want compiled-only run ``bqaa-materialize-
-# window --extraction-mode=compiled-only --bundles-root ...
-# --reference-extractors-module ...`` directly (e.g., from a
-# custom Cloud Run image they build themselves).
+# Both ``ai-fallback`` and ``compiled-only`` are accepted on this
+# deploy path. The mode is threaded down via ``BQAA_EXTRACTION_MODE``
+# and (in compiled-only) ``BQAA_REFERENCE_EXTRACTORS_MODULE``, and
+# controls the conditional ``roles/aiplatform.user`` grant a few
+# sections below.
 case "$EXTRACTION_MODE" in
-  ai-fallback) ;;
-  compiled-only)
-    cat >&2 <<'COMPILED_ONLY_NOT_READY'
-Error: --extraction-mode=compiled-only is not yet supported on the
-Cloud Run deploy path.
-
-The SDK accepts compiled-only mode (and the test suite proves it
-makes zero AI.GENERATE calls), but this deploy script does not yet
-stage the compiled extractor bundles / reference extractor module
-into the Cloud Run image. Running compiled-only here would skip
-both AI.GENERATE *and* the structured extractors and produce
-empty graphs with no diagnostic surface — a worse failure mode
-than the ai-fallback default.
-
-Until a follow-up PR wires bundles + reference extractor into the
-deploy artifact, use one of:
-
-  * --extraction-mode=ai-fallback  (the default; existing behavior)
-  * Run the CLI directly from a Cloud Run image you build, with
-    your own bundles wired:
-        bqaa-materialize-window \
-            --extraction-mode=compiled-only \
-            --bundles-root /path/to/bundles \
-            --reference-extractors-module your.reference.module \
-            ...
-COMPILED_ONLY_NOT_READY
-    exit 1
-    ;;
+  ai-fallback|compiled-only) ;;
   *)
-    echo "Error: --extraction-mode must be 'ai-fallback'; got '$EXTRACTION_MODE'." >&2
+    echo "Error: --extraction-mode must be 'ai-fallback' or 'compiled-only'; got '$EXTRACTION_MODE'." >&2
     exit 1
     ;;
 esac
@@ -403,23 +366,45 @@ _retry_iam gcloud projects add-iam-policy-binding "$PROJECT" \
 # checking ``rows_materialized``). The verification round in
 # #166 surfaced this — the deploy looks ``ok=true`` but the
 # entity tables stay empty.
-# ``roles/aiplatform.user`` is always granted on the deploy path
-# because this script only accepts ``--extraction-mode=ai-fallback``
-# (see the validator above; ``compiled-only`` is rejected until
-# bundles wiring lands). A follow-up PR that wires bundles into the
-# deploy image will revisit this grant to make it conditional on
-# ``--extraction-mode``: in compiled-only mode the SDK is already
-# proven (by ``TestCompiledOnlyMakesZeroLLMCalls``) to make zero
-# AI.GENERATE calls, so the role becomes safe to drop and the
-# script can both skip the add and ``remove-iam-policy-binding``
-# any pre-existing grant on the same SA (relevant when a customer
-# transitions an ai-fallback deploy to compiled-only).
-echo "==> granting project-level roles/aiplatform.user to $SA_EMAIL"
-_retry_iam gcloud projects add-iam-policy-binding "$PROJECT" \
-  --member "serviceAccount:${SA_EMAIL}" \
-  --role roles/aiplatform.user \
-  --condition=None \
-  --quiet
+# ``roles/aiplatform.user`` is conditional on ``--extraction-mode``:
+#
+# * ``ai-fallback`` (default): grant the role. Without it,
+#   ``AI.GENERATE`` returns "user does not have the permission
+#   to access resources used by AI.GENERATE" and the
+#   orchestrator silently materializes an empty graph
+#   (the SDK swallows per-event AI failures and reports
+#   ``sessions_materialized`` without checking
+#   ``rows_materialized`` — surfaced in #166's verification round).
+#
+# * ``compiled-only``: skip the grant — ``TestCompiledOnlyMakesZero
+#   LLMCalls`` proves the SDK never calls ``AI.GENERATE`` in this
+#   mode — AND idempotently remove any pre-existing grant from a
+#   prior ai-fallback deploy of the same SA. Without the remove
+#   step, a customer who flips an existing deploy from
+#   ai-fallback to compiled-only inherits the old role grant and
+#   the "compiled-only ⇒ no Vertex AI dependency" story silently
+#   breaks.
+#
+#   The remove is **deferred** until AFTER the new revision has
+#   been successfully deployed (and, if ``--smoke`` is set, after
+#   the smoke run passes). If we removed the role here and any
+#   later step failed (staging, buildpacks, ``gcloud run jobs
+#   deploy``, scheduler wiring), the previously-deployed
+#   ai-fallback container — still running under the existing
+#   schedule — would lose its required Vertex AI role mid-
+#   transition. Deferring keeps the existing scheduled deploy
+#   functional through every failure-of-the-new-deploy path.
+if [[ "$EXTRACTION_MODE" == "ai-fallback" ]]; then
+  echo "==> granting project-level roles/aiplatform.user to $SA_EMAIL"
+  _retry_iam gcloud projects add-iam-policy-binding "$PROJECT" \
+    --member "serviceAccount:${SA_EMAIL}" \
+    --role roles/aiplatform.user \
+    --condition=None \
+    --quiet
+else
+  echo "==> compiled-only mode: skipping roles/aiplatform.user grant on $SA_EMAIL"
+  echo "==> (any pre-existing roles/aiplatform.user grant will be removed after deploy succeeds)"
+fi
 
 # Dataset-level IAM via the BigQuery Python client (the
 # ``AccessEntry``-based update API — legacy and fully
@@ -500,6 +485,14 @@ cp "${SCRIPT_DIR}/run_job.py" "$STAGING/"
 cp "${ARTIFACTS_DIR}/ontology.yaml" "$STAGING/"
 cp "${ARTIFACTS_DIR}/binding.yaml" "$STAGING/"
 cp "${ARTIFACTS_DIR}/table_ddl.sql" "$STAGING/"
+# Stage the reference extractor module next to ``run_job.py`` so
+# Python can import it via ``BQAA_REFERENCE_EXTRACTORS_MODULE=
+# reference_extractor`` (Buildpacks sets the container working
+# directory to the staging dir's contents, which puts the
+# extractor on ``sys.path``). Shipped in both modes so an
+# operator who flips an existing deploy from ai-fallback to
+# compiled-only doesn't need to also re-stage extractor code.
+cp "${ARTIFACTS_DIR}/reference_extractor.py" "$STAGING/"
 
 # Vendor the local SDK source.
 mkdir -p "$STAGING/sdk_src/src"
@@ -557,6 +550,18 @@ ENV_VARS=(
 )
 if [[ -n "${MAX_SESSIONS}" ]]; then
   ENV_VARS+=("BQAA_MAX_SESSIONS=${MAX_SESSIONS}")
+fi
+# Compiled-only mode reads structured extractors out of the
+# staged ``reference_extractor.py`` module. Without this env
+# var, ``_build_manager`` would construct a manager with an
+# empty extractor registry and ``extract_graph(...,
+# on_unhandled_span='fail')`` would mark every session
+# ``empty_extraction`` — defeating the point of compiled-only.
+# ``BQAA_BUNDLES_ROOT`` stays unset on this default deploy
+# path; operators who pre-compile fingerprint-stable bundles
+# set it themselves on a custom image.
+if [[ "$EXTRACTION_MODE" == "compiled-only" ]]; then
+  ENV_VARS+=("BQAA_REFERENCE_EXTRACTORS_MODULE=reference_extractor")
 fi
 # Comma-join for --set-env-vars (no shell-quoting issues since
 # all values are simple identifiers / numbers).
@@ -644,6 +649,12 @@ echo "Service account:     ${SA_EMAIL}"
 if [[ "$SMOKE" == true ]]; then
   echo
   echo "==> running smoke execution (--smoke)"
+  # Capture the exit status so a failed smoke skips the deferred
+  # ``compiled-only`` IAM remove below: if the new revision can't
+  # even complete one execution, the existing schedule on the
+  # previous container is the safer fallback, and that fallback
+  # still needs ``roles/aiplatform.user``.
+  set +e
   EXECUTION_NAME="$(
     gcloud run jobs execute "$JOB_NAME" \
       --project "$PROJECT" \
@@ -651,6 +662,8 @@ if [[ "$SMOKE" == true ]]; then
       --wait \
       --format='value(metadata.name)'
   )"
+  SMOKE_RC=$?
+  set -e
   echo "==> execution: $EXECUTION_NAME"
   echo "==> tailing logs (last 50 lines):"
   gcloud logging read \
@@ -661,6 +674,76 @@ if [[ "$SMOKE" == true ]]; then
     --limit 50 \
     --format='value(textPayload,jsonPayload)' \
     || true
+  if [[ $SMOKE_RC -ne 0 ]]; then
+    echo "Error: smoke execution failed (exit ${SMOKE_RC}); leaving existing IAM unchanged." >&2
+    exit "$SMOKE_RC"
+  fi
+fi
+
+# ----------------------------------------------------------- #
+# 8. Compiled-only: deferred IAM remove                        #
+# ----------------------------------------------------------- #
+#
+# Runs ONLY after every earlier step succeeded — the new
+# revision is deployed, scheduler is wired, and (if ``--smoke``)
+# the new revision proved it can complete an execution. Any
+# failure before this point exited non-zero (``set -e`` at the
+# top of the script + the explicit ``exit "$SMOKE_RC"`` above),
+# so the existing ai-fallback deploy keeps its
+# ``roles/aiplatform.user`` and its schedule keeps working
+# during a botched transition.
+#
+# ``remove-iam-policy-binding`` is naturally non-idempotent:
+# gcloud returns non-zero with "Policy binding not found" if the
+# binding doesn't exist. We treat *that specific error* as
+# success (the common first-deploy case where the SA was never
+# granted the role), but surface every other failure
+# (``PERMISSION_DENIED``, org-policy reject, transient gcloud
+# errors, malformed condition) so the script's "Done." doesn't
+# claim victory while the role silently stays attached. The
+# previous ``2>/dev/null || true`` swallowed all of those.
+if [[ "$EXTRACTION_MODE" == "compiled-only" ]]; then
+  echo
+  echo "==> compiled-only deploy succeeded; idempotently removing any"
+  echo "    pre-existing roles/aiplatform.user grant from $SA_EMAIL"
+  REMOVE_STDERR="$(mktemp -t bqaa-iam-remove-stderr-XXXXXXXX)"
+  set +e
+  gcloud projects remove-iam-policy-binding "$PROJECT" \
+    --member "serviceAccount:${SA_EMAIL}" \
+    --role roles/aiplatform.user \
+    --condition=None \
+    --quiet 2>"$REMOVE_STDERR"
+  REMOVE_RC=$?
+  set -e
+  if [[ $REMOVE_RC -ne 0 ]]; then
+    # gcloud's "binding doesn't exist" error wording is stable
+    # across the current release channels: "Policy binding not
+    # found" (most cases). We match that exact substring so a
+    # future gcloud wording change becomes a loud failure, not a
+    # silent regression. Other failures (permission, network,
+    # org policy) carry different wording and fall through to
+    # the propagate-and-exit branch.
+    if grep -q "Policy binding not found" "$REMOVE_STDERR"; then
+      echo "    (no pre-existing roles/aiplatform.user grant — nothing to remove)"
+    else
+      echo "Error: failed to remove roles/aiplatform.user from $SA_EMAIL" >&2
+      echo "  gcloud exit code: $REMOVE_RC" >&2
+      echo "  gcloud stderr:" >&2
+      sed 's/^/    /' "$REMOVE_STDERR" >&2
+      echo "" >&2
+      echo "The new compiled-only revision is deployed and scheduled," >&2
+      echo "but $SA_EMAIL may still hold roles/aiplatform.user, which" >&2
+      echo "contradicts the 'no Vertex AI IAM' guarantee for" >&2
+      echo "--extraction-mode=compiled-only. Resolve the cause above," >&2
+      echo "then re-run this script or remove the role manually:" >&2
+      echo "  gcloud projects remove-iam-policy-binding $PROJECT \\" >&2
+      echo "    --member 'serviceAccount:$SA_EMAIL' \\" >&2
+      echo "    --role roles/aiplatform.user --condition=None" >&2
+      rm -f "$REMOVE_STDERR"
+      exit "$REMOVE_RC"
+    fi
+  fi
+  rm -f "$REMOVE_STDERR"
 fi
 
 echo
