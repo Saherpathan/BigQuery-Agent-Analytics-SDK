@@ -261,13 +261,13 @@ For this codelab you use a small synthetic event generator that writes the same 
 ```bash
 pip install google-cloud-bigquery
 cd ~/bqaa-codelab
-python seed_events.py \
+bqaa seed-events \
     --project-id "$PROJECT_ID" \
     --dataset-id "$DATASET" \
     --sessions 5
 ```
 
-You should see "Inserted 30 events across 5 sessions into ...".
+The command prints a JSON report. For 5 sessions you should see `"events_generated": 30`, `"events_inserted": 30`, and `"ok": true`.
 
 Verify the events landed:
 
