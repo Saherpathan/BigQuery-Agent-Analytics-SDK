@@ -2053,8 +2053,13 @@ def seed_events(
         "--events-table",
         help="Destination telemetry table name (in --dataset-id).",
     ),
-    sessions: int = typer.Option(
-        5, "--sessions", help="Number of synthetic decision sessions (>= 1)."
+    sessions: Optional[int] = typer.Option(
+        None,
+        "--sessions",
+        help=(
+            "Number of synthetic sessions (>= 1). Default depends on"
+            " --scenario: 5 for decision, 100 for decision-realistic."
+        ),
     ),
     seed: Optional[int] = typer.Option(
         None,
@@ -2067,7 +2072,10 @@ def seed_events(
     scenario: str = typer.Option(
         "decision",
         "--scenario",
-        help="Synthetic scenario to generate. Currently: decision.",
+        help=(
+            "Synthetic scenario: decision (small, default) or"
+            " decision-realistic (100-session, multi-day, mixed outcomes)."
+        ),
     ),
     dry_run: bool = typer.Option(
         False,
@@ -2080,8 +2088,10 @@ def seed_events(
 ) -> None:
   """Seed a dataset with synthetic agent_events for the context graph.
 
-  Generates completed decision sessions (TOOL_COMPLETED + AGENT_COMPLETED)
-  so ``bqaa context-graph`` has terminal-event-closed sessions to process.
+  Generates decision telemetry (TOOL_COMPLETED + AGENT_COMPLETED) so
+  ``bqaa context-graph`` has sessions to process. The ``decision`` scenario
+  emits only terminal-event-closed sessions; ``decision-realistic`` also
+  includes failed, truncated, and orphaned (no terminal event) sessions.
 
   Exit codes:
       0 — events generated (and inserted, unless --dry-run).
