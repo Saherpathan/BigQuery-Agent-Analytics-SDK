@@ -19,7 +19,7 @@ Three core architectural advantages distinguish this approach from traditional e
 
 * **BigQuery-Native Architecture**: There is no new database infrastructure to provision, manage, or pay for. The raw events, materialized property graph, identity and access management (IAM), billing, and analytical queries all remain natively within BigQuery.  
 * **Governed by Design**: The architecture supports a strong security posture. The event log dataset remains read-only to the materialization engine, while the graph dataset serves as the write target. The execution service account uses least-privilege access, and every run is logged to a state table, providing a complete audit trail of the materialization history.  
-* **Deterministic and AI-Driven Extraction**: You can choose how data is extracted from your events. By default, the system can use LLM-based extraction (`AI.GENERATE_TEXT`) for flexible onboarding against variable log structures. For regulated workloads requiring strict determinism, you can use a compiled extraction mode to run custom, auditor-verifiable Python parser modules without any external AI dependencies.
+* **Deterministic and AI-Driven Extraction**: You can choose how data is extracted from your events. By default, the system can use LLM-based extraction (`AI.GENERATE`) for flexible onboarding against variable log structures. For regulated workloads requiring strict determinism, you can use a compiled extraction mode to run custom, auditor-verifiable Python parser modules without any external AI dependencies.
 
 ---
 
@@ -46,18 +46,34 @@ runner = Runner(agent=root_agent, plugins=[plugin])
 Next, you define the property graph schema directly in BigQuery. This schema represents your domain-specific decision model: the agent's context, decision points, alternatives evaluated, and selected outcomes. You define this model once using standard SQL Data Definition Language (DDL).
 
 ```sql
-CREATE OR REPLACE PROPERTY GRAPH graph_v5.agent_decisions_graph
+CREATE OR REPLACE PROPERTY GRAPH graph.agent_decisions_graph
 NODE TABLES (
-  graph_v5.DecisionExecution,
-  graph_v5.DecisionPoint,
-  graph_v5.Candidate,
-  graph_v5.SelectionOutcome
+  graph.DecisionExecution
+    KEY (decision_execution_id) LABEL DecisionExecution,
+  graph.DecisionPoint
+    KEY (decision_point_id) LABEL DecisionPoint,
+  graph.Candidate
+    KEY (candidate_id) LABEL Candidate,
+  graph.SelectionOutcome
+    KEY (selection_outcome_id) LABEL SelectionOutcome
 )
 EDGE TABLES (
-  graph_v5.ExecutedAt BIND_CONNECTION (DecisionExecution TO DecisionPoint),
-  graph_v5.EvaluatesCandidate BIND_CONNECTION (DecisionPoint TO Candidate),
-  graph_v5.HasSelectionOutcome BIND_CONNECTION (DecisionExecution TO SelectionOutcome),
-  graph_v5.SelectedCandidate BIND_CONNECTION (SelectionOutcome TO Candidate)
+  graph.ExecutedAt
+    SOURCE KEY (decision_execution_id) REFERENCES DecisionExecution (decision_execution_id)
+    DESTINATION KEY (decision_point_id) REFERENCES DecisionPoint (decision_point_id)
+    LABEL executedAtDecisionPoint,
+  graph.EvaluatesCandidate
+    SOURCE KEY (decision_point_id) REFERENCES DecisionPoint (decision_point_id)
+    DESTINATION KEY (candidate_id) REFERENCES Candidate (candidate_id)
+    LABEL evaluatesCandidate,
+  graph.HasSelectionOutcome
+    SOURCE KEY (decision_execution_id) REFERENCES DecisionExecution (decision_execution_id)
+    DESTINATION KEY (selection_outcome_id) REFERENCES SelectionOutcome (selection_outcome_id)
+    LABEL hasSelectionOutcome,
+  graph.SelectedCandidate
+    SOURCE KEY (selection_outcome_id) REFERENCES SelectionOutcome (selection_outcome_id)
+    DESTINATION KEY (candidate_id) REFERENCES Candidate (candidate_id)
+    LABEL selectedCandidate
 );
 ```
 
@@ -77,7 +93,7 @@ During each run, the materializer:
     --project your-project-id \
     --region us-central1 \
     --events-dataset agent_analytics \
-    --graph-dataset graph_v5 \
+    --graph-dataset graph \
     --schedule "0 */6 * * *"
 ```
 
@@ -92,11 +108,11 @@ Using standard Graph Query Language (GQL) syntax in BigQuery, you can traverse t
 ```sql
 SELECT *
 FROM GRAPH_TABLE (
-  graph_v5.agent_decisions_graph
-  MATCH (de:DecisionExecution) -[[:executedAtDecisionPoint]]-> (dp:DecisionPoint),
-        (dp) -[[:evaluatesCandidate]]-> (option:Candidate),
-        (de) -[[:hasSelectionOutcome]]-> (so:SelectionOutcome),
-        (so) -[[:selectedCandidate]]-> (chosen:Candidate)
+  graph.agent_decisions_graph
+  MATCH (de:DecisionExecution) -[:executedAtDecisionPoint]-> (dp:DecisionPoint),
+        (dp) -[:evaluatesCandidate]-> (option:Candidate),
+        (de) -[:hasSelectionOutcome]-> (so:SelectionOutcome),
+        (so) -[:selectedCandidate]-> (chosen:Candidate)
   WHERE de.business_entity_id = 'customer-4029-7'
   COLUMNS (
     de.decision_execution_id AS decision_id,
