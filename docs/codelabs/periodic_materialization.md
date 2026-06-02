@@ -324,6 +324,8 @@ The 10 orphaned sessions never emitted `AGENT_COMPLETED`, so the default `bqaa c
 ## Phase 3: Materialize the Decision Graph
 Duration: 0:05
 
+`bqaa context-graph` reads the raw `agent_events`, uses the **ontology** to identify which entities and relationships to extract and the **binding** to map them onto your BigQuery tables and columns, then populates the tables behind the property graph. The property-graph schema you applied in Phase 1 only defines the *query surface* over those tables — it cannot populate them, which is exactly why this step requires both `--ontology` and `--binding`.
+
 Run the materializer locally:
 
 <!-- colab:code bash -->
@@ -387,7 +389,7 @@ The materializer offers two extraction paths. Pick the one that matches your wor
 ## Phase 4: Query the Decision Trace
 Duration: 0:05
 
-With the graph populated, the audit question is a single GQL traversal. Save the following as `traversal.sql`:
+With the graph populated, you can answer the audit question directly. Take a concrete one: *"For each request, what options did the agent weigh, and how did it resolve?"* In GQL that is a single traversal across the request, its options, and its outcome. Save the following as `traversal.sql`:
 
 <!-- colab:markdown -->
 ```sql
@@ -453,11 +455,19 @@ For a single decision's full picture, filter by `request_id` to get the row set 
 
 ### Ask the Same Question in Plain English
 
-Not every audit reader writes GQL. With **BigQuery Conversational Analytics** (Preview), your compliance team can ask the same decision-trace question in natural language and get back a structured answer card — no query syntax, no joins to learn:
+Not every audit reader writes GQL. With **BigQuery Conversational Analytics** (Preview), your compliance team can ask the same kind of question in natural language and get back a structured answer card — no query syntax, no joins to learn.
 
-> *"Why did the agent commit outcome X on request Y?"*
+Register the `agent_decisions_graph` (along with the `agent_events` and decision tables) as a Conversational Analytics data source, then ask the audit question directly:
 
-Register the property graph you built in this codelab as a Conversational Analytics knowledge source and the same data is reachable from a chat-style interface. See the [Conversational Analytics documentation](https://cloud.google.com/bigquery/docs/conversational-analytics) for setup.
+**Audit question (plain English):** *"Which requests never reached a committed outcome?"*
+
+Conversational Analytics reasons over the graph, writes the SQL for you, and replies in plain English with a supporting table — here, that every recorded request reached a committed outcome:
+
+![Conversational Analytics answering "Which requests never reached a committed outcome?" over the decision graph: every recorded request reached a committed outcome (orphaned sessions are not materialized as graph nodes)](images/ca-conversation.png)
+
+> The reply above reflects the realistic-scale corpus from the optional *Realistic-scale data* step (90 materialized requests, all committed). Your exact numbers depend on which corpus you seeded — the default 5-session run shows five.
+
+See the [Conversational Analytics documentation](https://cloud.google.com/bigquery/docs/conversational-analytics) for setup.
 
 ## Advanced: Replay a Past Window
 Duration: 0:04
