@@ -1767,6 +1767,32 @@ def views_create(
 # ------------------------------------------------------------------ #
 
 
+def _validate_context_graph_input_mode(
+    ontology_path: Optional[str],
+    binding_path: Optional[str],
+    property_graph_path: Optional[str],
+) -> None:
+  """Enforce exactly one input mode for the graph-refresh command.
+
+  Exactly one of (``--ontology`` + ``--binding``) or ``--property-graph`` must
+  be supplied. Raises ``typer.BadParameter`` (rendered as a usage error)
+  otherwise. Kept as a pure helper so the rule is unit-tested directly rather
+  than through brittle assertions on rendered CLI output.
+  """
+  has_separated = ontology_path is not None or binding_path is not None
+  if property_graph_path is not None and has_separated:
+    raise typer.BadParameter(
+        "Use either --property-graph or --ontology/--binding, not both."
+    )
+  if property_graph_path is None and (
+      ontology_path is None or binding_path is None
+  ):
+    raise typer.BadParameter(
+        "Provide --property-graph PATH, or both --ontology PATH and"
+        " --binding PATH."
+    )
+
+
 @app.command("materialize-window")
 def materialize_window(
     project_id: str = typer.Option(
@@ -1775,11 +1801,28 @@ def materialize_window(
     dataset_id: str = typer.Option(
         ..., envvar="BQ_AGENT_DATASET", help="BigQuery dataset."
     ),
-    ontology_path: str = typer.Option(
-        ..., "--ontology", help="Path to ontology YAML file."
+    ontology_path: Optional[str] = typer.Option(
+        None,
+        "--ontology",
+        help=(
+            "Path to ontology YAML file. Use with --binding, or omit both and"
+            " pass --property-graph to derive them from the graph DDL."
+        ),
     ),
-    binding_path: str = typer.Option(
-        ..., "--binding", help="Path to binding YAML file."
+    binding_path: Optional[str] = typer.Option(
+        None,
+        "--binding",
+        help="Path to binding YAML file (use with --ontology).",
+    ),
+    property_graph_path: Optional[str] = typer.Option(
+        None,
+        "--property-graph",
+        help=(
+            "Path to a CREATE PROPERTY GRAPH .sql file. Derives the ontology"
+            " and binding from the graph definition + table schemas, so no"
+            " hand-written ontology.yaml/binding.yaml is needed. Mutually"
+            " exclusive with --ontology/--binding."
+        ),
     ),
     events_table: str = typer.Option(
         "agent_events",
@@ -1977,6 +2020,12 @@ def materialize_window(
       2 — unexpected internal error (load failure, missing flag,
           programming bug).
   """
+  # Validate the input mode before any work: exactly one of
+  # (--ontology + --binding) or (--property-graph).
+  _validate_context_graph_input_mode(
+      ontology_path, binding_path, property_graph_path
+  )
+
   try:
     from .materialize_window import _parse_backfill_timestamp
     from .materialize_window import run_materialize_window
@@ -1994,6 +2043,7 @@ def materialize_window(
         dataset_id=dataset_id,
         ontology_path=ontology_path,
         binding_path=binding_path,
+        property_graph_path=property_graph_path,
         events_table=events_table,
         lookback_hours=lookback_hours,
         overlap_minutes=overlap_minutes,
