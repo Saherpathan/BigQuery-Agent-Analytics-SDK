@@ -4,7 +4,8 @@ import '@xyflow/react/dist/style.css';
 import { cn } from '../lib/utils';
 import { Activity, Wrench, Bot, AlertCircle, Loader2 } from 'lucide-react';
 import { useDashboardFilters } from '../hooks/useDashboardFilters';
-import { fetchAgentData } from '../services/apiService';
+import { useDashboardHealth } from '../hooks/useDashboardHealth';
+import { fetchAgentData, isBigQueryAuthError } from '../services/apiService';
 
 // Define the Node UI
 function CustomNode({ data }: any) {
@@ -52,30 +53,15 @@ const nodeTypes = { customNode: CustomNode };
 
 export const TraceTree: React.FC = () => {
   const { filters } = useDashboardFilters();
+  const { ready: authReady, loading: healthLoading } = useDashboardHealth();
   const [traceData, setTraceData] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
 
-  useEffect(() => {
-    const loadTrace = async () => {
-      setLoading(true);
-      try {
-        // Fetch raw data using current timespan
-        const data = await fetchAgentData(filters.timespan);
-        setTraceData(Array.isArray(data) ? data : []);
-      } catch (err) {
-        console.error("Trace load failed", err);
-      } finally {
-        setLoading(false);
-      }
-    };
-    loadTrace();
-  }, [filters.timespan, filters.agentId]);
-
+  // compute nodes/edges from traceData with a stable hook order
   const { nodes, edges } = useMemo(() => {
     const flowNodes: Node[] = traceData.map((node, i) => {
-      // Logic to determine vertical level
       const depth = node.type === 'orchestrator' ? 0 : node.type === 'agent' ? 1 : 2;
-      
       return {
         id: node.id || node.trace_id || `node-${i}`,
         type: 'customNode',
@@ -101,11 +87,68 @@ export const TraceTree: React.FC = () => {
     return { nodes: flowNodes, edges: flowEdges };
   }, [traceData]);
 
+  const sourceReady = Boolean(filters.projectId && filters.datasetId && filters.tableId && authReady);
+
+  useEffect(() => {
+    const loadTrace = async () => {
+      if (healthLoading) {
+        return;
+      }
+
+      if (!sourceReady) {
+        setTraceData([]);
+        setError('');
+        setLoading(false);
+        return;
+      }
+
+      setLoading(true);
+      setError('');
+      try {
+        // Fetch raw data using current timespan
+        const data = await fetchAgentData(filters.timespan, filters);
+        setTraceData(Array.isArray(data) ? data : []);
+      } catch (err) {
+        if (!isBigQueryAuthError(err)) {
+          console.error("Trace load failed", err);
+        }
+        setError(err instanceof Error ? err.message : 'Failed to load trace data');
+        setTraceData([]);
+      } finally {
+        setLoading(false);
+      }
+    };
+    loadTrace();
+  }, [filters.timespan, filters.agentId, filters.userId, filters.traceId, filters.spanId, filters.projectId, filters.datasetId, filters.tableId, sourceReady]);
+
+  if (!sourceReady) {
+    return (
+      <div className="h-[500px] flex flex-col items-center justify-center rounded-xl border border-dashed border-zinc-800 bg-zinc-950/30 text-center">
+        <p className="text-sm font-semibold text-white">
+          {!authReady ? 'Trace view is waiting for backend BigQuery auth' : 'Trace view is waiting for your BigQuery table'}
+        </p>
+        <p className="mt-2 text-xs text-zinc-500">
+          {!authReady
+            ? 'Set GOOGLE_APPLICATION_CREDENTIALS or GCP_CLIENT_EMAIL and GCP_PRIVATE_KEY on the dashboard backend.'
+            : 'Enter the project, dataset, and table IDs to reconstruct the reasoning graph.'}
+        </p>
+      </div>
+    );
+  }
+
   if (loading) {
     return (
       <div className="h-[500px] flex flex-col items-center justify-center bg-brand-bg/50 rounded-xl">
         <Loader2 className="animate-spin text-brand-primary mb-4" size={32} />
         <p className="text-xs font-mono text-zinc-500 uppercase tracking-widest">Reconstructing Logic Flow...</p>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="h-[500px] flex items-center justify-center rounded-xl border border-red-500/20 bg-red-500/5 text-sm text-red-200">
+        {error}
       </div>
     );
   }

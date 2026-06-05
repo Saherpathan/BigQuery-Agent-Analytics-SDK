@@ -6,6 +6,10 @@ export interface DashboardFilters {
   userId: string;
   timespan: string;
   traceId: string;
+  spanId: string;
+  projectId: string;
+  datasetId: string;
+  tableId: string;
 }
 
 export function useDashboardFilters() {
@@ -17,6 +21,10 @@ export function useDashboardFilters() {
     userId: searchParams.get('user_id') || 'all',
     timespan: searchParams.get('timespan') || '24h',
     traceId: searchParams.get('trace_id') || '',
+    spanId: searchParams.get('span_id') || '',
+    projectId: searchParams.get('project_id') || localStorage.getItem('user_gcp_project') || '',
+    datasetId: searchParams.get('dataset_id') || localStorage.getItem('user_bq_dataset') || '',
+    tableId: searchParams.get('table_id') || localStorage.getItem('user_bq_table') || '',
   }), [searchParams]);
 
   /**
@@ -38,6 +46,13 @@ export function useDashboardFilters() {
     if (newFilters.agentId !== undefined) updateParam('agent_id', newFilters.agentId);
     if (newFilters.userId !== undefined) updateParam('user_id', newFilters.userId);
     if (newFilters.timespan !== undefined) updateParam('timespan', newFilters.timespan);
+    if (newFilters.spanId !== undefined) {
+      if (newFilters.spanId) params.set('span_id', newFilters.spanId);
+      else params.delete('span_id');
+    }
+    if (newFilters.projectId !== undefined) updateParam('project_id', newFilters.projectId);
+    if (newFilters.datasetId !== undefined) updateParam('dataset_id', newFilters.datasetId);
+    if (newFilters.tableId !== undefined) updateParam('table_id', newFilters.tableId);
     
     if (newFilters.traceId !== undefined) {
       if (newFilters.traceId) params.set('trace_id', newFilters.traceId);

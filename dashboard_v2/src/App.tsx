@@ -1,14 +1,27 @@
 import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { CommandBar } from './components/CommandBar';
-import { FinOpsSummary } from './components/FinOpsSummary';
+import { AnalyticsOverview } from './components/AnalyticsOverview';
 import { TraceTree } from './components/TraceTree';
 import { AuditLog } from './components/AuditLog';
 import { ShieldCheck } from 'lucide-react';
+import { useDashboardFilters } from './hooks/useDashboardFilters';
+import { useDashboardHealth } from './hooks/useDashboardHealth';
 
 const queryClient = new QueryClient();
 
 function Dashboard() {
+  const { filters } = useDashboardFilters();
+  const { ready: authReady, loading: healthLoading, missing: missingAuth } = useDashboardHealth();
+  const sourceLabel = filters.projectId && filters.datasetId && filters.tableId
+    ? `${filters.projectId}.${filters.datasetId}.${filters.tableId}`
+    : 'Awaiting project.dataset.table';
+  const setupLabel = healthLoading
+    ? 'Checking backend auth...'
+    : authReady
+      ? sourceLabel
+      : `Backend auth not configured${missingAuth.length ? `: ${missingAuth.join(', ')}` : ''}`;
+
   return (
     <div className="min-h-screen bg-brand-bg flex flex-col selection:bg-brand-primary/30">
       {/* CommandBar manages its own filter state internally 
@@ -32,11 +45,14 @@ function Dashboard() {
               Monitor multi-agent systems with trace-level diagnostics. Analyze token economics, 
               orchestration latency, and cross-agent tool handoffs in real-time.
             </p>
+            <div className="mt-4 inline-flex items-center gap-2 rounded-full border border-zinc-800 bg-zinc-950/60 px-3 py-1 text-[10px] font-mono uppercase tracking-[0.2em] text-zinc-400">
+              Active Source: <span className="text-white normal-case tracking-normal">{setupLabel}</span>
+            </div>
           </div>
 
           {/* 1. FinOps & Token Economics */}
           <section className="mb-12">
-             <FinOpsSummary />
+             <AnalyticsOverview />
           </section>
 
           {/* 2. Forensic Reasoning Traces */}

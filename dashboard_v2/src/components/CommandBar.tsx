@@ -8,7 +8,10 @@ import {
   Key, 
   Database, 
   Table as TableIcon, 
-  LayoutGrid 
+  LayoutGrid,
+  User,
+  Fingerprint,
+  PanelTop,
 } from 'lucide-react';
 import { useDashboardFilters } from '../hooks/useDashboardFilters';
 import { cn } from '../lib/utils';
@@ -19,9 +22,15 @@ export const CommandBar: React.FC = () => {
 
   // --- User Credentials State ---
   const [apiKey, setApiKey] = useState(localStorage.getItem('user_gemini_key') || '');
-  const [projectId, setProjectId] = useState(localStorage.getItem('user_gcp_project') || '');
-  const [datasetId, setDatasetId] = useState(localStorage.getItem('user_bq_dataset') || '');
-  const [tableId, setTableId] = useState(localStorage.getItem('user_bq_table') || '');
+  const [projectId, setProjectId] = useState(filters.projectId || localStorage.getItem('user_gcp_project') || '');
+  const [datasetId, setDatasetId] = useState(filters.datasetId || localStorage.getItem('user_bq_dataset') || '');
+  const [tableId, setTableId] = useState(filters.tableId || localStorage.getItem('user_bq_table') || '');
+
+  React.useEffect(() => {
+    setProjectId(filters.projectId || '');
+    setDatasetId(filters.datasetId || '');
+    setTableId(filters.tableId || '');
+  }, [filters.projectId, filters.datasetId, filters.tableId]);
 
   // Handle sharing the current dashboard URL
   const handleShare = async () => {
@@ -53,6 +62,30 @@ export const CommandBar: React.FC = () => {
               options={['all', 'orchestrator', 'billing_agent', 'swot_analyzer', 'research_bot']}
               onChange={(v) => setFilters({ agentId: v })}
             />
+
+            <TextFilter
+              icon={<User size={14} />}
+              label="User"
+              value={filters.userId || 'all'}
+              placeholder="user-id"
+              onChange={(value) => setFilters({ userId: value || 'all' })}
+            />
+
+            <TextFilter
+              icon={<Fingerprint size={14} />}
+              label="Trace"
+              value={filters.traceId || ''}
+              placeholder="trace-id"
+              onChange={(value) => setFilters({ traceId: value })}
+            />
+
+            <TextFilter
+              icon={<PanelTop size={14} />}
+              label="Span"
+              value={filters.spanId || ''}
+              placeholder="span-id"
+              onChange={(value) => setFilters({ spanId: value })}
+            />
             
             <FilterSelect 
               icon={<Calendar size={14} />} 
@@ -64,7 +97,7 @@ export const CommandBar: React.FC = () => {
           </div>
         </div>
 
-        {/* Right: Data Source Inputs (BYO Credentials) */}
+        {/* Right: Customer-owned Billing Inputs */}
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2 px-4 border-l border-zinc-800">
             
@@ -84,49 +117,56 @@ export const CommandBar: React.FC = () => {
             </div>
 
             {/* GCP PROJECT ID */}
-            <div className="relative group" title="GCP Project ID">
+            <div className="relative group" title="Customer-owned GCP Project ID">
               <LayoutGrid className="absolute left-2 top-1/2 -translate-y-1/2 text-zinc-600 group-focus-within:text-blue-400 transition-colors" size={10} />
               <input 
                 type="text" 
-                placeholder="Project ID" 
+                placeholder="Your Project" 
                 value={projectId}
                 onChange={(e) => {
                   setProjectId(e.target.value);
                   localStorage.setItem('user_gcp_project', e.target.value);
+                  setFilters({ projectId: e.target.value });
                 }}
                 className="h-8 w-28 bg-zinc-900/50 border border-zinc-800 rounded pl-7 pr-2 text-[10px] text-blue-400 focus:border-blue-400/50 outline-none transition-all placeholder:text-zinc-700"
               />
             </div>
 
             {/* BIGQUERY DATASET */}
-            <div className="relative group" title="BigQuery Dataset ID">
+            <div className="relative group" title="Customer-owned BigQuery Dataset ID">
               <Database className="absolute left-2 top-1/2 -translate-y-1/2 text-zinc-600 group-focus-within:text-zinc-300 transition-colors" size={10} />
               <input 
                 type="text" 
-                placeholder="Dataset" 
+                placeholder="Your Dataset" 
                 value={datasetId}
                 onChange={(e) => {
                   setDatasetId(e.target.value);
                   localStorage.setItem('user_bq_dataset', e.target.value);
+                  setFilters({ datasetId: e.target.value });
                 }}
                 className="h-8 w-24 bg-zinc-900/50 border border-zinc-800 rounded pl-7 pr-2 text-[10px] text-zinc-300 focus:border-zinc-500/50 outline-none transition-all placeholder:text-zinc-700"
               />
             </div>
 
             {/* BIGQUERY TABLE */}
-            <div className="relative group" title="BigQuery Table ID">
+            <div className="relative group" title="Customer-owned BigQuery Table ID">
               <TableIcon className="absolute left-2 top-1/2 -translate-y-1/2 text-zinc-600 group-focus-within:text-zinc-300 transition-colors" size={10} />
               <input 
                 type="text" 
-                placeholder="Table" 
+                placeholder="Your Table" 
                 value={tableId}
                 onChange={(e) => {
                   setTableId(e.target.value);
                   localStorage.setItem('user_bq_table', e.target.value);
+                  setFilters({ tableId: e.target.value });
                 }}
                 className="h-8 w-24 bg-zinc-900/50 border border-zinc-800 rounded pl-7 pr-2 text-[10px] text-zinc-300 focus:border-zinc-500/50 outline-none transition-all placeholder:text-zinc-700"
               />
             </div>
+          </div>
+
+          <div className="hidden xl:flex items-center gap-2 rounded-full border border-zinc-800 bg-zinc-950/60 px-3 py-1 text-[10px] font-mono uppercase tracking-[0.18em] text-zinc-500">
+            <span className="text-zinc-700">Future:</span> custom labels
           </div>
 
           <button 
@@ -176,5 +216,28 @@ const FilterSelect: React.FC<FilterSelectProps> = ({ icon, label, value, options
         <Filter size={10} />
       </div>
     </div>
+  </div>
+);
+
+interface TextFilterProps {
+  icon: React.ReactNode;
+  label: string;
+  value: string;
+  placeholder: string;
+  onChange: (val: string) => void;
+}
+
+const TextFilter: React.FC<TextFilterProps> = ({ icon, label, value, placeholder, onChange }) => (
+  <div className="flex items-center gap-2.5">
+    <div className="flex items-center gap-1.5 text-[10px] font-black uppercase tracking-tighter text-zinc-500">
+      <span className="text-zinc-600">{icon}</span>
+      {label}
+    </div>
+    <input
+      value={value}
+      placeholder={placeholder}
+      onChange={(e) => onChange(e.target.value)}
+      className="h-7 w-28 rounded border border-zinc-800 bg-zinc-900/20 px-2 text-[11px] font-mono text-zinc-300 outline-none transition-all placeholder:text-zinc-700 hover:border-zinc-700 focus:border-brand-primary/50"
+    />
   </div>
 );

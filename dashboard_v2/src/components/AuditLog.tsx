@@ -2,19 +2,35 @@ import React, { useEffect, useState } from 'react';
 import { formatCurrency, formatCompactNumber } from '../lib/utils';
 import { ArrowUpRight, Clock, Hash, Coins, Loader2, User } from 'lucide-react';
 import { useDashboardFilters } from '../hooks/useDashboardFilters';
-import { fetchAgentData } from '../services/apiService';
+import { useDashboardHealth } from '../hooks/useDashboardHealth';
+import { fetchAgentData, isBigQueryAuthError } from '../services/apiService';
 
 export const AuditLog: React.FC = () => {
   const { filters } = useDashboardFilters();
+  const { ready: authReady, loading: healthLoading } = useDashboardHealth();
   const [sessions, setSessions] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const sourceReady = Boolean(filters.projectId && filters.datasetId && filters.tableId && authReady);
 
   useEffect(() => {
     const loadData = async () => {
+      if (healthLoading) {
+        return;
+      }
+
+      if (!sourceReady) {
+        setSessions([]);
+        setError('');
+        setLoading(false);
+        return;
+      }
+
       setLoading(true);
+      setError('');
       try {
         // Fetch raw rows for the selected timespan
-        const rawData = await fetchAgentData(filters.timespan);
+        const rawData = await fetchAgentData(filters.timespan, filters);
         
         /**
          * AGGREGATION LOGIC
@@ -40,19 +56,50 @@ export const AuditLog: React.FC = () => {
 
         setSessions(Object.values(grouped)); 
       } catch (error) {
-        console.error("Failed to fetch sessions:", error);
+        if (!isBigQueryAuthError(error)) {
+          console.error("Failed to fetch sessions:", error);
+        }
+        setError(error instanceof Error ? error.message : 'Failed to load audit log data');
+        setSessions([]);
       } finally {
         setLoading(false);
       }
     };
     loadData();
-  }, [filters.timespan]);
+  }, [filters.timespan, filters.agentId, filters.userId, filters.traceId, filters.spanId, filters.projectId, filters.datasetId, filters.tableId, sourceReady]);
+
+  if (!sourceReady) {
+    return (
+      <div className="px-6 pb-10">
+        <div className="rounded-xl border border-dashed border-zinc-800 bg-zinc-950/30 p-8 text-center text-zinc-400">
+          <p className="text-sm font-semibold text-white">
+            {!authReady ? 'Audit log is waiting for backend BigQuery auth' : 'Audit log is waiting for your BigQuery source'}
+          </p>
+          <p className="mt-2 text-xs text-zinc-500">
+            {!authReady
+              ? 'Set GOOGLE_APPLICATION_CREDENTIALS or GCP_CLIENT_EMAIL and GCP_PRIVATE_KEY on the dashboard backend.'
+              : 'Once the project, dataset, and table IDs are set, the session history will appear here.'}
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   if (loading) {
     return (
       <div className="p-12 flex flex-col justify-center items-center h-64 text-zinc-500 bg-brand-card/10 rounded-xl border border-brand-border border-dashed">
         <Loader2 className="animate-spin mb-3 text-brand-primary" size={24} />
         <span className="text-[10px] font-mono uppercase tracking-[0.2em]">Aggregating Session Data...</span>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="px-6 pb-10">
+        <div className="rounded-xl border border-red-500/20 bg-red-500/5 p-6 text-sm text-red-200">
+          {error}
+        </div>
       </div>
     );
   }

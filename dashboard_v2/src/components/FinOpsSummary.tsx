@@ -3,20 +3,38 @@ import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContai
 import { TrendingUp, Wallet, Zap, MessageSquare } from 'lucide-react';
 import { cn, formatCompactNumber, formatCurrency } from '../lib/utils';
 import { useDashboardFilters } from '../hooks/useDashboardFilters';
-import { fetchAgentData } from '../services/apiService';
+import { useDashboardHealth } from '../hooks/useDashboardHealth';
+import { fetchAgentData, isBigQueryAuthError } from '../services/apiService';
 
 export const FinOpsSummary: React.FC = () => {
   const { filters } = useDashboardFilters();
+  const { ready: authReady, loading: healthLoading, missing: missingAuth } = useDashboardHealth();
   const [stats, setStats] = useState<any>(null);
   const [consumptionData, setConsumptionData] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string>('');
+  const [copied, setCopied] = useState(false);
+  const sourceReady = Boolean(filters.projectId && filters.datasetId && filters.tableId && authReady);
 
   useEffect(() => {
     const loadFinOps = async () => {
+      if (healthLoading) {
+        return;
+      }
+
+      if (!sourceReady) {
+        setStats(null);
+        setConsumptionData([]);
+        setError('');
+        setLoading(false);
+        return;
+      }
+
       setLoading(true);
+      setError('');
       try {
         // Fetch raw rows from BigQuery based on selected timespan
-        const rawData = await fetchAgentData(filters.timespan);
+        const rawData = await fetchAgentData(filters.timespan, filters);
         
         /** * DATA TRANSFORMER
          * Since BigQuery returns raw rows, we calculate the summary metrics here.
@@ -45,21 +63,82 @@ export const FinOpsSummary: React.FC = () => {
 
         setConsumptionData(trend);
       } catch (err) {
-        console.error("FinOps Load Failed:", err);
+        if (!isBigQueryAuthError(err)) {
+          console.error("FinOps Load Failed:", err);
+        }
+        setError(err instanceof Error ? err.message : 'Failed to load dashboard data');
+        setStats(null);
+        setConsumptionData([]);
       } finally {
         setLoading(false);
       }
     };
     loadFinOps();
-  }, [filters.timespan]); // Re-run whenever timespan changes
+  }, [filters.timespan, filters.projectId, filters.datasetId, filters.tableId, sourceReady]); // Re-run when scope or timespan changes
 
-  if (loading || !stats) {
+  if (!sourceReady) {
+    return (
+      <div className="p-6">
+        <div className="rounded-xl border border-dashed border-zinc-700 bg-zinc-950/40 p-8 text-center text-zinc-400">
+          <p className="text-sm font-semibold text-white">
+            {!authReady ? 'Connect backend BigQuery auth to load your dashboard' : 'Connect a BigQuery source to load your dashboard'}
+          </p>
+          <p className="mt-2 text-xs text-zinc-500">
+            {!authReady
+              ? 'Set GOOGLE_APPLICATION_CREDENTIALS or GCP_CLIENT_EMAIL and GCP_PRIVATE_KEY on the dashboard backend.'
+              : 'Enter Project ID, Dataset ID, and Table ID in the command bar above. The metrics and traces will refresh automatically.'}
+          </p>
+          {!authReady && missingAuth.length > 0 && (
+            <div className="mt-4 text-xs text-zinc-400">
+              <div className="font-medium text-zinc-200">Missing backend variables:</div>
+              <ul className="mt-2 space-y-1 list-disc list-inside">
+                {missingAuth.map((m) => (
+                  <li key={m} className="text-zinc-400">{m}</li>
+                ))}
+              </ul>
+              <div className="mt-4 flex items-center justify-center gap-3">
+                <button
+                  onClick={async () => {
+                    const envSnippet = `# Option A: use a service account JSON file\nexport GOOGLE_APPLICATION_CREDENTIALS="./service-account.json"\n\n# Option B: set individual env vars (replace placeholders)\nexport GCP_CLIENT_EMAIL=\"your-service-account@PROJECT.iam.gserviceaccount.com\"\nexport GCP_PRIVATE_KEY=\"-----BEGIN PRIVATE KEY-----\\nYOUR_PRIVATE_KEY_HERE\\n-----END PRIVATE KEY-----\"\n`;
+                    try {
+                      await navigator.clipboard.writeText(envSnippet);
+                      setCopied(true);
+                      setTimeout(() => setCopied(false), 2000);
+                    } catch (e) {
+                      console.error('Clipboard copy failed', e);
+                    }
+                  }}
+                  className="rounded-md border border-zinc-700 bg-zinc-900/60 px-3 py-1 text-[12px] font-medium text-zinc-200 hover:bg-zinc-900"
+                >
+                  {copied ? 'Copied!' : 'Copy env snippet'}
+                </button>
+                <span className="text-[11px] text-zinc-500">Copies a ready-to-edit env snippet to clipboard.</span>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (loading) {
     return (
       <div className="grid grid-cols-12 gap-6 p-6">
         {[1, 2, 3, 4].map((i) => (
           <div key={i} className="col-span-12 md:col-span-3 h-32 animate-pulse bg-zinc-900/50 rounded-xl border border-zinc-800" />
         ))}
         <div className="col-span-12 h-80 animate-pulse bg-zinc-900/20 rounded-xl border border-zinc-800" />
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="p-6">
+        <div className="rounded-xl border border-red-500/20 bg-red-500/5 p-6 text-sm text-red-200">
+          <p className="font-semibold">Unable to load this dashboard view</p>
+          <p className="mt-2 text-red-200/80">{error}</p>
+        </div>
       </div>
     );
   }

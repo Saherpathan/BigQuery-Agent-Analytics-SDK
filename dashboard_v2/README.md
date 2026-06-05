@@ -1,5 +1,9 @@
 # BigQuery Dashboard
 
+This dashboard is designed to be deployed once per customer. Each customer
+hosts their own copy, connects it to their own BigQuery project, and pays for
+their own query jobs.
+
 🚀 **Live Demo:** https://dash-vercel-testing.vercel.app/
 
 
@@ -7,7 +11,8 @@
 
 # Features
 
-- Connect to Google BigQuery
+- Self-hosted per customer
+- Connect to a customer-owned Google BigQuery project
 - Enter:
   - Project ID
   - Dataset ID
@@ -35,7 +40,7 @@ Before running the project, ensure you have:
 
 - Node.js >= 18
 - npm or pnpm
-- Google Cloud Platform account
+- A Google Cloud Platform account owned by the customer
 - BigQuery enabled
 - Service Account credentials
 
@@ -60,12 +65,15 @@ npm install
 
 # Environment Variables
 
-Create a `.env` file in the root directory.
+Create a `.env` file in the dashboard deployment for that customer.
 
 ```env
 GCP_PROJECT_ID=your-project-id
 GOOGLE_APPLICATION_CREDENTIALS=./service-account.json
 ```
+
+For a ready-to-edit template, see `dashboard_v2/.env.example`. For step-by-step
+local setup and troubleshooting, see `LOCAL_SETUP.md` at the repository root.
 
 For Vercel deployment:
 
@@ -82,8 +90,13 @@ The API connector supports two authentication modes:
 - Vercel: `GCP_PROJECT_ID`, `GCP_CLIENT_EMAIL`, and `GCP_PRIVATE_KEY`.
 
 The Project / Dataset / Table fields in the dashboard identify the
-`agent_events` table to read. The service account still needs permission to
-run jobs in `GCP_PROJECT_ID` and read from the selected table.
+customer-owned table to read. The service account must belong to that
+customer's environment and have permission to run jobs in the selected
+project and read from the selected table.
+
+If you want to avoid being involved with access management, do not host a
+shared dashboard instance. Instead, give each customer their own deployment
+and their own service account or Google auth flow.
 
 ---
 
@@ -140,8 +153,9 @@ App will run on:
 http://localhost:3000
 ```
 
-`npm run dev` starts only Vite. Use it for UI-only work; BigQuery-backed
-dashboard data requires `npx vercel dev` or a deployed Vercel environment.
+`npm run dev` now serves `/api` locally, so the dashboard can load data in
+plain Vite development. Use `npx vercel dev` when you want the Vercel runtime
+path specifically.
 
 ---
 
@@ -160,6 +174,10 @@ npm run preview
 ---
 
 # Deploying to Vercel
+
+For a self-hosted-per-customer setup, create one Vercel project per customer
+or template the repo so each customer deploys their own copy with their own
+BigQuery credentials.
 
 Install Vercel CLI:
 
@@ -250,9 +268,9 @@ Ensure the service account has:
 - BigQuery Job User
 
 If the dashboard returns "Missing Configuration", fill in Project ID, Dataset
-ID, and Table ID in the command bar. If it returns a BigQuery permissions
-error, confirm the service account can run query jobs in `GCP_PROJECT_ID` and
-read the selected table.
+ID, and Table ID in the command bar for that customer's deployment. If it
+returns a BigQuery permissions error, confirm the customer's service account
+can run query jobs in `GCP_PROJECT_ID` and read the selected table.
 
 ---
 
