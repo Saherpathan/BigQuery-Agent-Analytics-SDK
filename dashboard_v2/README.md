@@ -75,19 +75,6 @@ GOOGLE_APPLICATION_CREDENTIALS=./service-account.json
 For a ready-to-edit template, see `dashboard_v2/.env.example`. For step-by-step
 local setup and troubleshooting, see `LOCAL_SETUP.md` at the repository root.
 
-For Vercel deployment:
-
-```env
-GCP_PROJECT_ID=your-project-id
-GCP_CLIENT_EMAIL=your-client-email
-GCP_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nYOUR_KEY\n-----END PRIVATE KEY-----\n"
-```
-
-The API connector supports two authentication modes:
-
-- Local development: Application Default Credentials or
-  `GOOGLE_APPLICATION_CREDENTIALS`.
-- Vercel: `GCP_PROJECT_ID`, `GCP_CLIENT_EMAIL`, and `GCP_PRIVATE_KEY`.
 
 The Project / Dataset / Table fields in the dashboard identify the
 customer-owned table to read. The service account must belong to that
@@ -173,57 +160,6 @@ npm run preview
 
 ---
 
-# Deploying to Vercel
-
-For a self-hosted-per-customer setup, create one Vercel project per customer
-or template the repo so each customer deploys their own copy with their own
-BigQuery credentials.
-
-Install Vercel CLI:
-
-```bash
-npm install -g vercel
-```
-
-Login:
-
-```bash
-vercel login
-```
-
-Deploy:
-
-```bash
-vercel
-```
-
----
-
-# Vercel Environment Variables
-
-In Vercel Dashboard:
-
-Project → Settings → Environment Variables
-
-Add:
-
-```env
-GCP_PROJECT_ID=
-GCP_CLIENT_EMAIL=
-GCP_PRIVATE_KEY=
-```
-
-Important:
-
-Replace actual line breaks in the private key with `\n`.
-
-Example:
-
-```env
-GCP_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nABC123\n-----END PRIVATE KEY-----\n"
-```
-
----
 
 # Example BigQuery Query
 
@@ -284,43 +220,5 @@ GCP_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
 
 ---
 
-# Available Scripts
-
-```json
-{
-  "dev": "vite",
-  "build": "vite build",
-  "preview": "vite preview"
-}
-```
-
----
-
-# Folder Structure
-
-## `/src/components`
-Reusable UI components
-
-## `/src/hooks`
-Custom React hooks
-
-## `/src/services`
-API services and BigQuery logic
-
-## `/src/lib`
-Helper utilities
-
-## `/api`
-Server-side API routes for Vercel
 
 
----
-
-# Security Notes
-
-- Never commit `.env`
-- Never commit service account keys
-- Use backend APIs for BigQuery queries
-- Keep credentials server-side only
-
----
