@@ -1230,6 +1230,23 @@ def _parse_backfill_timestamp(
 # ------------------------------------------------------------------ #
 
 
+def _state_table_defaults(
+    project_id: str,
+    dataset_id: str,
+    graph_project_id: Optional[str],
+    graph_dataset_id: Optional[str],
+) -> tuple[str, str]:
+  """Default project/dataset for the state table.
+
+  Follows the graph target when split-dataset mode is in use
+  (``graph_dataset_id`` / ``graph_project_id`` set), so the per-run
+  checkpoint is never written into a read-only events dataset. Defaults to
+  ``project_id`` / ``dataset_id`` otherwise (single-dataset shape). An explicit
+  ``state_table`` always overrides these defaults.
+  """
+  return (graph_project_id or project_id, graph_dataset_id or dataset_id)
+
+
 def _resolve_ontology_binding(
     *,
     ontology_path: Optional[str],
@@ -1238,6 +1255,8 @@ def _resolve_ontology_binding(
     project_id: str,
     dataset_id: str,
     bq_client: Any,
+    graph_project_id: Optional[str] = None,
+    graph_dataset_id: Optional[str] = None,
 ):
   """Resolve the ``(Ontology, Binding)`` pair from one of two input modes.
 
@@ -1246,6 +1265,13 @@ def _resolve_ontology_binding(
     file) -- parse it, read column types from ``INFORMATION_SCHEMA.COLUMNS``
     via ``bq_client``, and synthesise the pair in memory (#277). No
     hand-written ontology/binding required.
+
+  ``graph_project_id`` / ``graph_dataset_id`` target the derived graph (its
+  ``${PROJECT_ID}`` / ``${DATASET}`` placeholder resolution, schema lookup, and
+  binding target) at a project/dataset distinct from the events ``project_id`` /
+  ``dataset_id``. They default to ``project_id`` / ``dataset_id`` (single-dataset
+  shape, e.g. the codelab). A two-dataset deploy -- a read-only events dataset
+  and a separate graph dataset -- sets them to the graph dataset.
 
   Exactly one mode must be supplied; both or neither raises ``ValueError``.
   This is the single seam the orchestrator uses to obtain its spec, so both
@@ -1264,8 +1290,8 @@ def _resolve_ontology_binding(
     ddl_text = pathlib.Path(property_graph_path).read_text(encoding="utf-8")
     return derive_ontology_binding_from_ddl(
         ddl_text,
-        project_id=project_id,
-        dataset_id=dataset_id,
+        project_id=graph_project_id or project_id,
+        dataset_id=graph_dataset_id or dataset_id,
         bq_client=bq_client,
     )
 
@@ -1286,6 +1312,8 @@ def run_materialize_window(
     ontology_path: Optional[str] = None,
     binding_path: Optional[str] = None,
     property_graph_path: Optional[str] = None,
+    graph_project_id: Optional[str] = None,
+    graph_dataset_id: Optional[str] = None,
     events_table: str = "agent_events",
     lookback_hours: float,
     overlap_minutes: float = DEFAULT_OVERLAP_MINUTES,
@@ -1321,6 +1349,13 @@ def run_materialize_window(
       schema-derived input mode; the ontology + binding are synthesised from
       the graph definition and live table schemas. Mutually exclusive with
       ``ontology_path`` / ``binding_path``; exactly one mode must be supplied.
+    graph_project_id, graph_dataset_id: For schema-derived mode, the project /
+      dataset that holds the graph tables and receives the materialized graph
+      (``${PROJECT_ID}`` / ``${DATASET}`` placeholder resolution, schema lookup,
+      and binding target). Default to ``project_id`` / ``dataset_id`` (the
+      single-dataset shape). A two-dataset deploy -- a read-only events dataset
+      (``dataset_id``) and a separate graph dataset -- sets these to the graph
+      dataset so events are still read from ``dataset_id``.
     events_table: Source telemetry table name (relative to
       ``--dataset-id``).
     lookback_hours: Window size. The discovery query lower bound
@@ -1556,10 +1591,18 @@ def run_materialize_window(
 
   # Resolve identifiers + qualified refs.
   events_table_ref = validated_table_ref(project_id, dataset_id, events_table)
+  # The state/checkpoint table is written every run, so it must live in a
+  # WRITABLE dataset. In split-dataset mode (graph_dataset_id set, e.g. a
+  # read-only events dataset + a separate graph dataset) it defaults to the
+  # graph target, never the events dataset. An explicit --state-table still
+  # wins. Single-dataset callers are unchanged (graph_* default to events).
+  state_default_project, state_default_dataset = _state_table_defaults(
+      project_id, dataset_id, graph_project_id, graph_dataset_id
+  )
   state_project, state_dataset, state_table_local = parse_state_table_ref(
       state_table or DEFAULT_STATE_TABLE_NAME,
-      default_project=project_id,
-      default_dataset=dataset_id,
+      default_project=state_default_project,
+      default_dataset=state_default_dataset,
   )
   state_table_ref = f"{state_project}.{state_dataset}.{state_table_local}"
 
@@ -1574,6 +1617,8 @@ def run_materialize_window(
       property_graph_path=property_graph_path,
       project_id=project_id,
       dataset_id=dataset_id,
+      graph_project_id=graph_project_id,
+      graph_dataset_id=graph_dataset_id,
       bq_client=client,
   )
   ontology_fp = fingerprint_model(ontology_obj)
