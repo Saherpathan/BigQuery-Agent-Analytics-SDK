@@ -590,6 +590,7 @@ try:
   from .extractor_compilation import AstFailure
   from .extractor_compilation import AstReport
   from .extractor_compilation import AttemptRecord
+  from .extractor_compilation import BigQueryBundleStore
   from .extractor_compilation import build_ast_diagnostic
   from .extractor_compilation import build_compile_result_diagnostic
   from .extractor_compilation import build_gate_diagnostic
@@ -598,6 +599,10 @@ try:
   from .extractor_compilation import build_retry_prompt
   from .extractor_compilation import build_runtime_extractor_registry
   from .extractor_compilation import build_smoke_diagnostic
+  from .extractor_compilation import BUNDLE_MIRROR_TABLE_SCHEMA
+  from .extractor_compilation import BundleRow
+  from .extractor_compilation import BundleStore
+  from .extractor_compilation import check_thresholds
   from .extractor_compilation import compile_extractor
   from .extractor_compilation import compile_with_llm
   from .extractor_compilation import CompileMeasurement
@@ -606,6 +611,7 @@ try:
   from .extractor_compilation import compute_fingerprint
   from .extractor_compilation import discover_bundles
   from .extractor_compilation import DiscoveryResult
+  from .extractor_compilation import EventTypeCounts
   from .extractor_compilation import FallbackOutcome
   from .extractor_compilation import FieldMapping
   from .extractor_compilation import LLMClient
@@ -614,18 +620,27 @@ try:
   from .extractor_compilation import LoadFailure
   from .extractor_compilation import Manifest
   from .extractor_compilation import measure_compile
+  from .extractor_compilation import MirrorFailure
   from .extractor_compilation import OutcomeCallback
   from .extractor_compilation import parse_resolved_extractor_plan_json
   from .extractor_compilation import PlanParseError
   from .extractor_compilation import PlanResolver
+  from .extractor_compilation import publish_bundles_to_bq
+  from .extractor_compilation import PublishResult
   from .extractor_compilation import render_extractor_source
   from .extractor_compilation import RESOLVED_EXTRACTOR_PLAN_JSON_SCHEMA
   from .extractor_compilation import ResolvedExtractorPlan
   from .extractor_compilation import RetryCompileResult
+  from .extractor_compilation import revalidate_compiled_extractors
+  from .extractor_compilation import RevalidationReport
+  from .extractor_compilation import RevalidationThresholds
   from .extractor_compilation import run_smoke_test
   from .extractor_compilation import run_with_fallback
   from .extractor_compilation import SmokeTestReport
   from .extractor_compilation import SpanHandlingRule
+  from .extractor_compilation import sync_bundles_from_bq
+  from .extractor_compilation import SyncResult
+  from .extractor_compilation import ThresholdCheckResult
   from .extractor_compilation import validate_source
   from .extractor_compilation import WrappedRegistry
 
@@ -634,15 +649,23 @@ try:
           "AstFailure",
           "AstReport",
           "AttemptRecord",
+          "BUNDLE_MIRROR_TABLE_SCHEMA",
+          "BigQueryBundleStore",
+          "BundleRow",
+          "BundleStore",
           "CompileMeasurement",
           "CompileResult",
           "CompileSource",
           "DiscoveryResult",
+          "EventTypeCounts",
           "FallbackOutcome",
           "FieldMapping",
           "LoadFailure",
           "LoadedBundle",
+          "MirrorFailure",
           "OutcomeCallback",
+          "PublishResult",
+          "SyncResult",
           "WrappedRegistry",
           "LLMClient",
           "Manifest",
@@ -651,8 +674,11 @@ try:
           "RESOLVED_EXTRACTOR_PLAN_JSON_SCHEMA",
           "ResolvedExtractorPlan",
           "RetryCompileResult",
+          "RevalidationReport",
+          "RevalidationThresholds",
           "SmokeTestReport",
           "SpanHandlingRule",
+          "ThresholdCheckResult",
           "build_ast_diagnostic",
           "build_compile_result_diagnostic",
           "build_gate_diagnostic",
@@ -660,6 +686,7 @@ try:
           "build_resolution_prompt",
           "build_retry_prompt",
           "build_smoke_diagnostic",
+          "check_thresholds",
           "compile_extractor",
           "compile_with_llm",
           "compute_fingerprint",
@@ -667,9 +694,12 @@ try:
           "load_bundle",
           "measure_compile",
           "parse_resolved_extractor_plan_json",
+          "publish_bundles_to_bq",
           "build_runtime_extractor_registry",
           "render_extractor_source",
+          "revalidate_compiled_extractors",
           "run_smoke_test",
+          "sync_bundles_from_bq",
           "run_with_fallback",
           "validate_source",
       ]
@@ -679,3 +709,34 @@ except ImportError as e:
       "Could not import extractor compilation scaffolding: %s.",
       e,
   )
+
+# Ontology runtime reader (issue #58 reader follow-on to PR #92)
+from .ontology_runtime import ConceptIndexError
+from .ontology_runtime import ConceptIndexLookup
+from .ontology_runtime import ConceptIndexRowView
+from .ontology_runtime import EntityResolver
+from .ontology_runtime import ExactEntityResolver
+from .ontology_runtime import FingerprintMismatchError
+from .ontology_runtime import LabelSynonymResolver
+from .ontology_runtime import MetaTableEmptyError
+from .ontology_runtime import MetaTableMissingError
+from .ontology_runtime import MetaTableMultipleRowsError
+from .ontology_runtime import OntologyRuntime
+from .ontology_runtime import ResolverCandidate
+
+__all__.extend(
+    [
+        "ConceptIndexError",
+        "ConceptIndexLookup",
+        "ConceptIndexRowView",
+        "EntityResolver",
+        "ExactEntityResolver",
+        "FingerprintMismatchError",
+        "LabelSynonymResolver",
+        "MetaTableEmptyError",
+        "MetaTableMissingError",
+        "MetaTableMultipleRowsError",
+        "OntologyRuntime",
+        "ResolverCandidate",
+    ]
+)

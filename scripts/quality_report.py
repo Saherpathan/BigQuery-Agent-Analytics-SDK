@@ -41,6 +41,7 @@ Usage:
     python quality_report.py --samples all        # show all sessions
     python quality_report.py --app-name my_agent  # filter to a specific agent
     python quality_report.py --output-json r.json # write structured JSON output
+    python quality_report.py --config config.json # use scope definitions from config
     python quality_report.py --env path/to/.env   # load a specific .env file
 """
 import warnings
@@ -48,12 +49,12 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import argparse
+from datetime import datetime
 import json
 import logging
 import os
 import sys
 import time
-from datetime import datetime
 
 
 def _positive_int(value):
@@ -71,6 +72,7 @@ def _samples_arg(value):
     raise argparse.ArgumentTypeError("--samples must be 'all' or >= 1")
   return str(n)
 
+
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 _repo_root = os.path.join(_script_dir, "..")
 
@@ -86,10 +88,14 @@ def _configure_logging():
       datefmt="%H:%M:%S",
   )
   for _noisy in (
-      "google.genai", "google_genai",
-      "google.adk", "google_adk",
-      "google.auth", "google_auth",
-      "httpx", "httpcore",
+      "google.genai",
+      "google_genai",
+      "google.adk",
+      "google_adk",
+      "google.auth",
+      "google_auth",
+      "httpx",
+      "httpcore",
   ):
     logging.getLogger(_noisy).setLevel(logging.ERROR)
 
@@ -117,6 +123,7 @@ def _load_dotenv(env_file=None):
 # ---------------------------------------------------------------------------
 # Configuration from environment
 # ---------------------------------------------------------------------------
+
 
 def _require_env(name: str) -> str:
   val = os.environ.get(name)
@@ -149,6 +156,7 @@ EVAL_MODEL_ID = None
 # SDK client
 # ---------------------------------------------------------------------------
 
+
 def get_client():
   from bigquery_agent_analytics import Client
 
@@ -161,14 +169,90 @@ def get_client():
 
 
 # ---------------------------------------------------------------------------
+# Scope configuration
+# ---------------------------------------------------------------------------
+
+_AGENT_CONFIG_CACHE: dict[str, dict] = {}
+
+
+def _load_agent_config(config_path=None):
+  """Load agent config (scope decisions, etc.) from a JSON file.
+
+  When --config is provided, loads from that path.  Otherwise checks
+  for eval/data/agent_context.json relative to the repo root or script dir.
+  Returns None if no config is found (scope-aware eval is disabled).
+
+  Raises:
+    FileNotFoundError: If an explicit config_path does not exist.
+  """
+  cache_key = config_path or "_AUTO_"
+  if cache_key in _AGENT_CONFIG_CACHE:
+    return _AGENT_CONFIG_CACHE[cache_key]
+
+  if config_path:
+    if not os.path.isfile(config_path):
+      raise FileNotFoundError(f"Config file not found: {config_path}")
+    with open(config_path) as f:
+      result = json.load(f)
+    _AGENT_CONFIG_CACHE[cache_key] = result
+    return result
+
+  # Auto-discover agent_context.json from known locations
+  for base in [_repo_root, _script_dir]:
+    candidate = os.path.join(base, "eval", "data", "agent_context.json")
+    if os.path.isfile(candidate):
+      logger.info("Auto-discovered agent context: %s", candidate)
+      with open(candidate) as f:
+        result = json.load(f)
+      _AGENT_CONFIG_CACHE[cache_key] = result
+      return result
+
+  return None
+
+
+def _build_scope_context(config=None):
+  """Build scope context string for the LLM judge from config."""
+  if not config:
+    return ""
+
+  scope_decisions = config.get("scope_decisions", [])
+  oos_topics = [
+      d["topic"] for d in scope_decisions if d.get("decision") == "out_of_scope"
+  ]
+  if not oos_topics:
+    return ""
+
+  parts = [
+      "\n\nAGENT SCOPE CONTEXT (use this to judge responses correctly):",
+      "The following topics are OUT OF SCOPE: " + ", ".join(oos_topics) + ".",
+      "If the agent correctly declines a question about an out-of-scope "
+      "topic (says it cannot help with that topic, suggests what it CAN "
+      "help with), that is a MEANINGFUL response, not an unhelpful one.",
+  ]
+  return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # Metric definitions
 # ---------------------------------------------------------------------------
 
-def get_eval_metrics():
-  from bigquery_agent_analytics import (
-      CategoricalMetricCategory,
-      CategoricalMetricDefinition,
-  )
+
+def get_eval_metrics(config_path=None):
+  """Return the list of categorical metric definitions for quality evaluation.
+
+  Metrics returned:
+    - ``response_usefulness`` — whether the agent response is helpful,
+      unhelpful, partial, or a correct scope decline.  The ``declined``
+      category is always present; when *config_path* provides out-of-scope
+      topic definitions, the LLM judge receives additional context to
+      distinguish polite refusals from failures.
+    - ``task_grounding`` — whether the response is grounded in tool data.
+  """
+  from bigquery_agent_analytics import CategoricalMetricCategory
+  from bigquery_agent_analytics import CategoricalMetricDefinition
+
+  config = _load_agent_config(config_path)
+  scope_context = _build_scope_context(config)
 
   response_usefulness = CategoricalMetricDefinition(
       name="response_usefulness",
@@ -176,7 +260,9 @@ def get_eval_metrics():
           "Whether the agent final response provides a genuinely useful, "
           "substantive answer to the user question. A response that apologizes, "
           "says it cannot help, returns no data, provides only generic filler, "
-          "or loops without resolving the question is NOT useful."
+          "or loops without resolving the question is NOT useful -- UNLESS the "
+          "question is outside the agent's defined scope, in which case a "
+          "polite decline IS a correct and meaningful response." + scope_context
       ),
       categories=[
           CategoricalMetricCategory(
@@ -187,12 +273,23 @@ def get_eval_metrics():
               ),
           ),
           CategoricalMetricCategory(
+              name="declined",
+              definition=(
+                  "The question is outside the agent's defined scope and the "
+                  "agent correctly declined -- e.g. said it cannot help with "
+                  "that topic, or suggested what it CAN help with. This is "
+                  "the CORRECT behavior for out-of-scope questions."
+              ),
+          ),
+          CategoricalMetricCategory(
               name="unhelpful",
               definition=(
-                  "The response technically succeeded (no error) but does NOT "
-                  "meaningfully answer the user question. Examples: apologies, "
-                  "saying I do not have that information, empty data results, "
-                  "generic filler text, or the agent looping without a resolution."
+                  "The response does NOT meaningfully answer the user question "
+                  "AND the question IS within the agent's scope. Examples: "
+                  "apologies for in-scope topics, saying 'I do not have that "
+                  "information' when the agent has a tool that covers the topic, "
+                  "empty data results, generic filler text, or the agent looping "
+                  "without a resolution."
               ),
           ),
           CategoricalMetricCategory(
@@ -244,15 +341,28 @@ def get_eval_metrics():
 # Trace helpers - extract Q&A and resolve A2A responses
 # ---------------------------------------------------------------------------
 
+
 def get_user_input(trace) -> str:
+  """Return the last user message in the trace.
+
+  Multi-turn sessions have multiple USER_MESSAGE_RECEIVED events.  We want
+  the *last* one so that question/response pairs stay aligned — the response
+  resolution helpers (get_a2a_response, get_responding_agent) already search
+  in reverse and return the most recent answer.
+  """
+  result = ""
   for span in trace.spans:
     if span.event_type == "USER_MESSAGE_RECEIVED":
       c = span.content
       if isinstance(c, dict):
-        return c.get("text_summary") or c.get("text") or ""
+        text = c.get("text_summary") or c.get("text") or ""
       elif c:
-        return str(c)
-  return ""
+        text = str(c)
+      else:
+        text = ""
+      if text:
+        result = text
+  return result
 
 
 def get_responding_agent(trace) -> str:
@@ -297,30 +407,44 @@ def _extract_a2a_text(payload) -> tuple:
 
 
 def get_a2a_response(trace) -> tuple:
+  """Return the last A2A response in the trace.
+
+  For multi-turn sessions we must return the *last* A2A interaction to stay
+  aligned with get_user_input (which also returns the last user message).
+  If the last A2A interaction has null/empty content (e.g. the remote agent
+  returned nothing), we return ("(no response)", agent) rather than falling
+  through to an earlier turn's response — that would create a misleading
+  question/response mismatch in the quality report.
+  """
   for span in reversed(trace.spans):
     if span.event_type == "A2A_INTERACTION":
       c = span.content
       if isinstance(c, dict):
         text, agent = _extract_a2a_text(c)
-        if text:
-          return text, agent or span.agent or "remote_agent"
+        agent = agent or span.agent or "remote_agent"
+        return (text or "(no response)"), agent
+      elif c is None:
+        # Null content means the remote agent returned nothing
+        return "(no response)", span.agent or "remote_agent"
       elif isinstance(c, str):
         try:
           parsed = json.loads(c)
           text, agent = _extract_a2a_text(parsed)
-          if text:
-            return text, agent or span.agent or "remote_agent"
+          agent = agent or span.agent or "remote_agent"
+          return (text or "(no response)"), agent
         except (json.JSONDecodeError, TypeError):
           logger.warning(
-              "Failed to parse A2A payload for session, skipping"
+              "Failed to parse A2A payload for session %s, skipping",
+              getattr(trace, "session_id", "?"),
           )
-          return None, None
+          return "(no response)", span.agent or "remote_agent"
   return None, None
 
 
 # ---------------------------------------------------------------------------
 # Resolve responses for a batch of traces
 # ---------------------------------------------------------------------------
+
 
 def resolve_trace_responses(traces):
   results = []
@@ -344,6 +468,8 @@ def resolve_trace_responses(traces):
       if a2a_resp:
         response = a2a_resp
         answered_by = a2a_agent
+        # Mark as A2A even for "(no response)" — the interaction happened,
+        # so the session should be attributed to the remote agent in stats.
         is_a2a = True
         remote_lookups += 1
 
@@ -351,19 +477,21 @@ def resolve_trace_responses(traces):
     if trace.total_latency_ms is not None:
       latency_s = round(trace.total_latency_ms / 1000, 1)
 
-    results.append({
-        "session_id": trace.session_id,
-        "time": (
-            trace.start_time.strftime("%Y-%m-%d %H:%M:%S")
-            if trace.start_time
-            else "?"
-        ),
-        "question": question,
-        "answered_by": answered_by,
-        "response": (response or ""),
-        "latency_s": latency_s,
-        "is_a2a": is_a2a,
-    })
+    results.append(
+        {
+            "session_id": trace.session_id,
+            "time": (
+                trace.start_time.strftime("%Y-%m-%d %H:%M:%S")
+                if trace.start_time
+                else "?"
+            ),
+            "question": question,
+            "answered_by": answered_by,
+            "response": (response or ""),
+            "latency_s": latency_s,
+            "is_a2a": is_a2a,
+        }
+    )
 
   if remote_lookups:
     logger.info("Resolved %d A2A responses", remote_lookups)
@@ -375,18 +503,24 @@ def resolve_trace_responses(traces):
 # Run evaluation
 # ---------------------------------------------------------------------------
 
+
 def run_evaluation(
-    time_range=None, limit=100, model=None, persist=False, app_name=None,
+    time_range=None,
+    limit=100,
+    model=None,
+    persist=False,
+    app_name=None,
+    config_path=None,
+    session_id=None,
     session_ids=None,
 ) -> dict:
-  from bigquery_agent_analytics import (
-      CategoricalEvaluationConfig, TraceFilter,
-  )
+  from bigquery_agent_analytics import CategoricalEvaluationConfig
+  from bigquery_agent_analytics import TraceFilter
 
   model = model or EVAL_MODEL_ID
   client = get_client()
-  metrics = get_eval_metrics()
 
+  metrics = get_eval_metrics(config_path=config_path)
   cat_config = CategoricalEvaluationConfig(
       metrics=metrics,
       endpoint=model,
@@ -396,10 +530,9 @@ def run_evaluation(
       results_table="quality_eval_results" if persist else None,
   )
 
-  # When explicit session IDs are provided, filter directly by them
-  # instead of relying on time-based queries that can pick up stale
-  # sessions from prior runs.
-  if session_ids:
+  if session_id:
+    trace_filter = TraceFilter(session_ids=[session_id])
+  elif session_ids:
     trace_filter = TraceFilter(
         session_ids=session_ids,
         limit=len(session_ids),
@@ -442,9 +575,11 @@ def run_evaluation(
 # Category labels
 # ---------------------------------------------------------------------------
 
+
 def _category_label(category):
   labels = {
       "meaningful": "\u2705 HELPFUL",
+      "declined": "\u2705 DECLINED (OK)",
       "unhelpful": "\u274c NOT HELPFUL",
       "partial": "\u26a0\ufe0f  PARTIAL",
       "grounded": "\u2705 GROUNDED",
@@ -458,6 +593,7 @@ def _category_label(category):
 # Browse mode (--no-eval)
 # ---------------------------------------------------------------------------
 
+
 def run_browse(args):
   from bigquery_agent_analytics import TraceFilter
 
@@ -466,14 +602,17 @@ def run_browse(args):
       "Project: %s, Dataset: %s, Table: %s", PROJECT_ID, DATASET_ID, TABLE_ID
   )
 
-  time_range = args.time_period
-  if time_range and time_range.lower() == "all":
-    time_range = None
-  if time_range:
-    trace_filter = TraceFilter.from_cli_args(last=time_range)
+  if args.session:
+    trace_filter = TraceFilter(session_ids=[args.session])
   else:
-    trace_filter = TraceFilter()
-  trace_filter.limit = args.limit
+    time_range = args.time_period
+    if time_range and time_range.lower() == "all":
+      time_range = None
+    if time_range:
+      trace_filter = TraceFilter.from_cli_args(last=time_range)
+    else:
+      trace_filter = TraceFilter()
+    trace_filter.limit = args.limit
   if args.app_name:
     trace_filter.root_agent_name = args.app_name
 
@@ -521,6 +660,7 @@ def run_browse(args):
 # Eval mode (default)
 # ---------------------------------------------------------------------------
 
+
 def run_eval(args):
   model = args.model or EVAL_MODEL_ID
   logger.info(
@@ -540,25 +680,41 @@ def run_eval(args):
   # Load session IDs from file if provided
   session_ids = None
   if args.session_ids_file:
-    import json as _json
     with open(args.session_ids_file) as _f:
-      _data = _json.load(_f)
+      _data = json.load(_f)
     # Accepts either a list of objects with "session_id" keys
-    # (run_eval.py output) or a plain list of strings.
+    # (e.g. output of examples/agent_improvement_cycle/eval/run_eval.py)
+    # or a plain list of strings.
     if _data and isinstance(_data[0], dict):
       session_ids = [r["session_id"] for r in _data if r.get("session_id")]
     else:
       session_ids = [s for s in _data if s]
-    logger.info("Filtering to %d session IDs from %s", len(session_ids), args.session_ids_file)
+    if not session_ids:
+      logger.error(
+          "No session IDs found in %s — file may be empty or missing "
+          "'session_id' fields.",
+          args.session_ids_file,
+      )
+      sys.exit(1)
+    logger.info(
+        "Filtering to %d session IDs from %s",
+        len(session_ids),
+        args.session_ids_file,
+    )
 
   t0 = time.time()
   try:
+    config_path = getattr(args, "config", None)
+    if config_path:
+      logger.info("Scope config: %s", config_path)
     result = run_evaluation(
         time_range=args.time_period,
         limit=args.limit,
         model=model,
         persist=args.persist,
         app_name=args.app_name,
+        config_path=config_path,
+        session_id=args.session,
         session_ids=session_ids,
     )
   except Exception:
@@ -574,13 +730,19 @@ def run_eval(args):
   result["report"].details["time_period"] = args.time_period or "all"
   result["report"].details["limit"] = args.limit
   result["report"].details["persist"] = args.persist
-  result["report"].details["samples"] = args.samples or "default (10/5/3)"
-  _print_eval_results(result["report"], result["resolved_map"], samples=args.samples,
-                      unhelpful_threshold=args.threshold)
+  result["report"].details["samples"] = args.samples or None
+  _print_eval_results(
+      result["report"],
+      result["resolved_map"],
+      samples=args.samples,
+      unhelpful_threshold=args.threshold,
+  )
 
   report_path = None
   if args.report:
-    report_path = _write_md_report(result["report"], result["resolved_map"], args)
+    report_path = _write_md_report(
+        result["report"], result["resolved_map"], args
+    )
 
   if report_path:
     print(f"\n  Markdown report: {report_path}")
@@ -600,7 +762,12 @@ def run_eval(args):
 
 
 def _group_by_category(report):
-  by_category = {"unhelpful": [], "partial": [], "meaningful": []}
+  by_category = {
+      "unhelpful": [],
+      "partial": [],
+      "meaningful": [],
+      "declined": [],
+  }
   for sr in report.session_results:
     for mr in sr.metrics:
       if mr.metric_name == "response_usefulness":
@@ -619,6 +786,7 @@ def _build_agent_stats(report, resolved_map):
       agent_stats[agent] = {
           "total": 0,
           "meaningful": 0,
+          "declined": 0,
           "unhelpful": 0,
           "partial": 0,
           "unclassified": 0,
@@ -633,6 +801,8 @@ def _build_agent_stats(report, resolved_map):
         found_usefulness = True
         if mr.category == "meaningful":
           agent_stats[agent]["meaningful"] += 1
+        elif mr.category == "declined":
+          agent_stats[agent]["declined"] += 1
         elif mr.category == "unhelpful":
           agent_stats[agent]["unhelpful"] += 1
         elif mr.category == "partial":
@@ -651,7 +821,9 @@ _METRIC_LABELS = {
 }
 
 
-def _print_eval_results(report, resolved_map, samples=None, unhelpful_threshold=10.0):
+def _print_eval_results(
+    report, resolved_map, samples=None, unhelpful_threshold=10.0
+):
   hr = "\u2500" * 70
 
   by_category = _group_by_category(report)
@@ -660,10 +832,17 @@ def _print_eval_results(report, resolved_map, samples=None, unhelpful_threshold=
   }
 
   # --- Per-session details ---
-  _default_samples = {"unhelpful": 10, "partial": 5, "meaningful": 3, "unknown": 3}
+  _default_samples = {
+      "unhelpful": 10,
+      "partial": 5,
+      "meaningful": 3,
+      "declined": 3,
+      "unknown": 3,
+  }
   for cat, cat_label in [
       ("unhelpful", "UNHELPFUL"),
       ("partial", "PARTIAL"),
+      ("declined", "DECLINED (out-of-scope)"),
       ("meaningful", "MEANINGFUL"),
       ("unknown", "UNCLASSIFIED (parse errors)"),
   ]:
@@ -714,7 +893,9 @@ def _print_eval_results(report, resolved_map, samples=None, unhelpful_threshold=
   agent_stats = _build_agent_stats(report, resolved_map)
 
   if agent_stats:
-    total_helpful_all = sum(s["meaningful"] for s in agent_stats.values())
+    total_helpful_all = sum(
+        s["meaningful"] + s["declined"] for s in agent_stats.values()
+    )
     total_unhelpful_all = sum(s["unhelpful"] for s in agent_stats.values())
 
     print(f"\n{hr}")
@@ -741,17 +922,14 @@ def _print_eval_results(report, resolved_map, samples=None, unhelpful_threshold=
         agent_stats.items(), key=lambda x: -x[1]["total"]
     ):
       total = stats["total"]
-      classified = stats["meaningful"] + stats["unhelpful"] + stats["partial"]
-      helpful_pct = (
-          (stats["meaningful"] / classified * 100) if classified > 0 else 0
-      )
+      helpful = stats["meaningful"] + stats["declined"]
+      classified = helpful + stats["unhelpful"] + stats["partial"]
+      helpful_pct = (helpful / classified * 100) if classified > 0 else 0
       unhelpful_pct = (
           (stats["unhelpful"] / classified * 100) if classified > 0 else 0
       )
       helpful_contrib = (
-          (stats["meaningful"] / total_helpful_all * 100)
-          if total_helpful_all > 0
-          else 0
+          (helpful / total_helpful_all * 100) if total_helpful_all > 0 else 0
       )
       unhelpful_contrib = (
           (stats["unhelpful"] / total_unhelpful_all * 100)
@@ -760,8 +938,10 @@ def _print_eval_results(report, resolved_map, samples=None, unhelpful_threshold=
       )
       a2a_n = stats["a2a_count"]
       a2a_tag = (
-          f" [A2A:{a2a_n}/{total}]" if 0 < a2a_n < total
-          else " [A2A]" if a2a_n == total
+          f" [A2A:{a2a_n}/{total}]"
+          if 0 < a2a_n < total
+          else " [A2A]"
+          if a2a_n == total
           else ""
       )
       status = (
@@ -770,7 +950,8 @@ def _print_eval_results(report, resolved_map, samples=None, unhelpful_threshold=
           else ("\U0001f7e1" if helpful_pct >= 60 else "\U0001f534")
       )
       agent_name = f"{agent}{a2a_tag}"
-      helpful_str = f"{stats['meaningful']} ({helpful_pct:.0f}%)"
+      declined_tag = f"+{stats['declined']}d" if stats["declined"] else ""
+      helpful_str = f"{stats['meaningful']}{declined_tag} ({helpful_pct:.0f}%)"
       unhelpful_str = f"{stats['unhelpful']} ({unhelpful_pct:.0f}%)"
       partial_str = str(stats["partial"])
       errors_str = str(stats.get("unclassified", 0))
@@ -801,8 +982,10 @@ def _print_eval_results(report, resolved_map, samples=None, unhelpful_threshold=
         bar = "\u2588" * int(contrib / 2)
         a2a_n = stats["a2a_count"]
         a2a_tag = (
-            f" [A2A:{a2a_n}/{stats['total']}]" if 0 < a2a_n < stats["total"]
-            else " [A2A]" if a2a_n == stats["total"]
+            f" [A2A:{a2a_n}/{stats['total']}]"
+            if 0 < a2a_n < stats["total"]
+            else " [A2A]"
+            if a2a_n == stats["total"]
             else ""
         )
         agent_name = f"{agent}{a2a_tag}"
@@ -815,6 +998,7 @@ def _print_eval_results(report, resolved_map, samples=None, unhelpful_threshold=
   fp_count = len(by_category.get("unhelpful", []))
   partial_count = len(by_category.get("partial", []))
   meaningful_count = len(by_category.get("meaningful", []))
+  declined_count = len(by_category.get("declined", []))
   unknown_count = len(by_category.get("unknown", []))
   total = report.total_sessions
   fp_rate = (fp_count / total * 100) if total > 0 else 0.0
@@ -824,6 +1008,7 @@ def _print_eval_results(report, resolved_map, samples=None, unhelpful_threshold=
   print(f"{'=' * 70}")
   print(f"  Total sessions evaluated : {total}")
   print(f"  Meaningful               : {meaningful_count}")
+  print(f"  Declined (out-of-scope)  : {declined_count}")
   print(f"  Partial                  : {partial_count}")
   print(f"  Unhelpful                : {fp_count}")
   print(f"  Unhelpful rate           : {fp_rate:.1f}%")
@@ -843,7 +1028,9 @@ def _print_eval_results(report, resolved_map, samples=None, unhelpful_threshold=
     for category, count in sorted(dist.items(), key=lambda x: -x[1]):
       pct = (count / dist_total * 100) if dist_total > 0 else 0.0
       bar = "#" * int(pct / 2)
-      print(f"    {_category_label(category):18s}: {count:4d}  ({pct:5.1f}%) {bar}")
+      print(
+          f"    {_category_label(category):18s}: {count:4d}  ({pct:5.1f}%) {bar}"
+      )
 
   hide_keys = {"parse_errors", "parse_error_rate"}
   print("\n  Execution Details:")
@@ -857,9 +1044,13 @@ def _print_eval_results(report, resolved_map, samples=None, unhelpful_threshold=
   print(f"{'=' * 70}")
 
   if fp_rate > unhelpful_threshold:
-    print(f"\n  WARNING: Unhelpful rate ({fp_rate:.1f}%) exceeds {unhelpful_threshold:.0f}% threshold!")
+    print(
+        f"\n  WARNING: Unhelpful rate ({fp_rate:.1f}%) exceeds {unhelpful_threshold:.0f}% threshold!"
+    )
   elif fp_rate > 0:
-    print(f"\n  Unhelpful responses detected but below {unhelpful_threshold:.0f}% threshold.")
+    print(
+        f"\n  Unhelpful responses detected but below {unhelpful_threshold:.0f}% threshold."
+    )
   else:
     print("\n  All responses were meaningful.")
 
@@ -867,6 +1058,7 @@ def _print_eval_results(report, resolved_map, samples=None, unhelpful_threshold=
 # ---------------------------------------------------------------------------
 # Markdown report generation
 # ---------------------------------------------------------------------------
+
 
 def _write_md_report(report, resolved_map, args):
   lines = []
@@ -892,6 +1084,7 @@ def _write_md_report(report, resolved_map, args):
   fp_count = len(by_category.get("unhelpful", []))
   partial_count = len(by_category.get("partial", []))
   meaningful_count = len(by_category.get("meaningful", []))
+  declined_count = len(by_category.get("declined", []))
   unknown_count = len(by_category.get("unknown", []))
   total = report.total_sessions
   fp_rate = (fp_count / total * 100) if total > 0 else 0.0
@@ -903,6 +1096,7 @@ def _write_md_report(report, resolved_map, args):
   w("|--------|-------|")
   w(f"| Total sessions | {total} |")
   w(f"| Meaningful | {meaningful_count} |")
+  w(f"| Declined (out-of-scope) | {declined_count} |")
   w(f"| Partial | {partial_count} |")
   w(f"| Unhelpful | {fp_count} |")
   w(f"| Unhelpful rate | {fp_rate:.1f}% |")
@@ -936,20 +1130,23 @@ def _write_md_report(report, resolved_map, args):
   if agent_stats:
     w("## Per-Agent Quality")
     w("")
-    w("| Agent | Sessions | Helpful | Unhelpful | Partial | Status |")
-    w("|-------|-------:|--------:|----------:|--------:|--------|")
+    w(
+        "| Agent | Sessions | Helpful | Declined | Unhelpful | Partial | Status |"
+    )
+    w("|-------|-------:|--------:|--------:|----------:|--------:|--------|")
     for agent, stats in sorted(
         agent_stats.items(), key=lambda x: -x[1]["total"]
     ):
-      classified = stats["meaningful"] + stats["unhelpful"] + stats["partial"]
-      helpful_pct = (
-          (stats["meaningful"] / classified * 100) if classified > 0 else 0
-      )
+      helpful = stats["meaningful"] + stats["declined"]
+      classified = helpful + stats["unhelpful"] + stats["partial"]
+      helpful_pct = (helpful / classified * 100) if classified > 0 else 0
       a2a_n = stats["a2a_count"]
       total = stats["total"]
       a2a_tag = (
-          f" [A2A:{a2a_n}/{total}]" if 0 < a2a_n < total
-          else " [A2A]" if a2a_n == total
+          f" [A2A:{a2a_n}/{total}]"
+          if 0 < a2a_n < total
+          else " [A2A]"
+          if a2a_n == total
           else ""
       )
       status = (
@@ -960,15 +1157,24 @@ def _write_md_report(report, resolved_map, args):
       w(
           f"| {agent}{a2a_tag} | {stats['total']} "
           f"| {stats['meaningful']} ({helpful_pct:.0f}%) "
+          f"| {stats['declined']} "
           f"| {stats['unhelpful']} | {stats['partial']} | {status} |"
       )
     w("")
 
   # --- Unhelpful Sessions ---
   unhelpful_sessions = by_category.get("unhelpful", [])
-  _md_samples = None if args.samples == "all" else (int(args.samples) if args.samples else None)
+  _md_samples = (
+      None
+      if args.samples == "all"
+      else (int(args.samples) if args.samples else None)
+  )
   if unhelpful_sessions:
-    shown = unhelpful_sessions if _md_samples is None else unhelpful_sessions[:_md_samples]
+    shown = (
+        unhelpful_sessions
+        if _md_samples is None
+        else unhelpful_sessions[:_md_samples]
+    )
     w("## Unhelpful Sessions")
     if len(shown) < len(unhelpful_sessions):
       w(f"\n*Showing {len(shown)} of {len(unhelpful_sessions)}*")
@@ -997,10 +1203,50 @@ def _write_md_report(report, resolved_map, args):
           w(f"  - *{mr.justification}*")
       w("")
 
+  # --- Declined Sessions ---
+  declined_sessions = by_category.get("declined", [])
+  if declined_sessions:
+    shown = (
+        declined_sessions
+        if _md_samples is None
+        else declined_sessions[:_md_samples]
+    )
+    w("## Declined Sessions")
+    if len(shown) < len(declined_sessions):
+      w(f"\n*Showing {len(shown)} of {len(declined_sessions)}*")
+    w("")
+    for sr in shown:
+      sid = sr.session_id
+      ctx = resolved_map.get(sid, {})
+      question = ctx.get("question", "")
+      response = ctx.get("response", "")
+      answered_by = ctx.get("answered_by", "")
+      a2a_tag = " [A2A]" if sid in a2a_session_ids else ""
+
+      q = " ".join(question.split()) if question else "(none)"
+      r = " ".join(response.split()) if response else "(none)"
+
+      w(f"### `{sid}`{a2a_tag} \u2192 {answered_by}")
+      w("")
+      w(f"- **Question:** {q}")
+      r_display = (r[:500] + "\u2026") if len(r) > 500 else r
+      w(f"- **Response:** {r_display}")
+      for mr in sr.metrics:
+        label = _category_label(mr.category)
+        display = _METRIC_LABELS.get(mr.metric_name, mr.metric_name)
+        w(f"- **{display}:** {label}")
+        if mr.justification:
+          w(f"  - *{mr.justification}*")
+      w("")
+
   # --- Partial Sessions ---
   partial_sessions = by_category.get("partial", [])
   if partial_sessions:
-    shown = partial_sessions if _md_samples is None else partial_sessions[:_md_samples]
+    shown = (
+        partial_sessions
+        if _md_samples is None
+        else partial_sessions[:_md_samples]
+    )
     w("## Partial Sessions")
     if len(shown) < len(partial_sessions):
       w(f"\n*Showing {len(shown)} of {len(partial_sessions)}*")
@@ -1055,6 +1301,7 @@ def _write_md_report(report, resolved_map, args):
 # JSON report output
 # ---------------------------------------------------------------------------
 
+
 def _build_json_output(report, resolved_map):
   """Build a structured dict for JSON output of evaluation results."""
   by_category = _group_by_category(report)
@@ -1069,36 +1316,42 @@ def _build_json_output(report, resolved_map):
           "category": mr.category,
           "justification": mr.justification,
       }
-    sessions.append({
-        "session_id": sr.session_id,
-        "question": ctx.get("question", ""),
-        "response": ctx.get("response", ""),
-        "answered_by": ctx.get("answered_by", ""),
-        "is_a2a": ctx.get("is_a2a", False),
-        "latency_s": ctx.get("latency_s"),
-        "metrics": metrics,
-    })
+    sessions.append(
+        {
+            "session_id": sr.session_id,
+            "question": ctx.get("question", ""),
+            "response": ctx.get("response", ""),
+            "answered_by": ctx.get("answered_by", ""),
+            "is_a2a": ctx.get("is_a2a", False),
+            "latency_s": ctx.get("latency_s"),
+            "metrics": metrics,
+        }
+    )
 
   fp_count = len(by_category.get("unhelpful", []))
   partial_count = len(by_category.get("partial", []))
   meaningful_count = len(by_category.get("meaningful", []))
+  declined_count = len(by_category.get("declined", []))
   total = report.total_sessions
 
   return {
       "summary": {
           "total_sessions": total,
           "meaningful": meaningful_count,
+          "declined": declined_count,
           "partial": partial_count,
           "unhelpful": fp_count,
-          "meaningful_rate": round(meaningful_count / total * 100, 1) if total else 0,
+          "meaningful_rate": round(
+              (meaningful_count + declined_count) / total * 100, 1
+          )
+          if total
+          else 0,
           "unhelpful_rate": round(fp_count / total * 100, 1) if total else 0,
       },
       "category_distributions": {
           k: dict(v) for k, v in report.category_distributions.items()
       },
-      "per_agent": {
-          agent: dict(stats) for agent, stats in agent_stats.items()
-      },
+      "per_agent": {agent: dict(stats) for agent, stats in agent_stats.items()},
       "sessions": sessions,
       "details": {k: str(v) for k, v in report.details.items()},
   }
@@ -1107,6 +1360,7 @@ def _build_json_output(report, resolved_map):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def main():
   parser = argparse.ArgumentParser(
@@ -1124,10 +1378,13 @@ Examples:
   %(prog)s --samples all             Show all sessions per category
   %(prog)s --app-name my_agent       Filter to a specific agent app
   %(prog)s --output-json report.json Write structured JSON output
+  %(prog)s --config config.json      Use scope definitions from config
       """,
   )
   parser.add_argument(
-      "--limit", type=_positive_int, default=100,
+      "--limit",
+      type=_positive_int,
+      default=100,
       help="Number of sessions (default: 100)",
   )
   parser.add_argument(
@@ -1171,12 +1428,18 @@ Examples:
       help="Max sample sessions to display per category, or 'all' (default: 10/5/3)",
   )
   parser.add_argument(
+      "--session",
+      type=str,
+      default=None,
+      help="Evaluate a specific session by ID",
+  )
+  parser.add_argument(
       "--app-name",
       type=str,
       default=None,
       help="Filter to sessions from a specific agent app name. Matches the "
-           "root_agent_name attribute set by BigQueryAgentAnalyticsPlugin; "
-           "sessions from other sources may not populate this field",
+      "root_agent_name attribute set by BigQueryAgentAnalyticsPlugin; "
+      "sessions from other sources may not populate this field",
   )
   parser.add_argument(
       "--output-json",
@@ -1184,7 +1447,7 @@ Examples:
       default=None,
       metavar="PATH",
       help="Write structured evaluation results as JSON to the given file path "
-           "(writes all sessions regardless of --samples)",
+      "(writes all sessions regardless of --samples)",
   )
   parser.add_argument(
       "--threshold",
@@ -1193,14 +1456,27 @@ Examples:
       help="Unhelpful rate warning threshold in %% (default: 10)",
   )
   parser.add_argument(
+      "--config",
+      type=str,
+      default=None,
+      metavar="PATH",
+      help="Path to a JSON config file with scope definitions. "
+      "When provided, adds a 'declined' category for correctly "
+      "refused out-of-scope questions. Expected format: "
+      '{"scope_decisions": [{"topic": "...", "decision": "out_of_scope", '
+      '"reason": "..."}]}. '
+      "Only 'topic' and 'decision' are used; 'reason' is documentation-only.",
+  )
+  parser.add_argument(
       "--session-ids-file",
       type=str,
       default=None,
       metavar="PATH",
       help="JSON file containing session IDs to evaluate. Expects a list of "
-           "objects with 'session_id' fields (e.g. the output of run_eval.py). "
-           "When set, only these sessions are evaluated — --limit and "
-           "--time-period are ignored.",
+      "objects with 'session_id' fields (e.g. the output of "
+      "examples/agent_improvement_cycle/eval/run_eval.py). "
+      "When set, only these sessions are evaluated — --limit and "
+      "--time-period are ignored.",
   )
   parser.add_argument(
       "--env",
@@ -1208,8 +1484,8 @@ Examples:
       default=None,
       metavar="PATH",
       help="Path to .env file to load (overrides default .env discovery). "
-           "Use this to point at a different agent's environment, e.g. "
-           "--env examples/agent_improvement_cycle/.env",
+      "Use this to point at a different agent's environment, e.g. "
+      "--env examples/agent_improvement_cycle/.env",
   )
 
   args = parser.parse_args()

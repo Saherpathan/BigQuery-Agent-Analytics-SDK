@@ -7,8 +7,573 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-05-22
+
+### Release highlights
+
+The migration-v5 production track lands the design-partner asks from
+[#187](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/187)
+end-to-end: backfill mode, compiled-only extraction (with zero-LLM
+guarantee), explicit FK→PK mapping that re-enables MAKO self-edges,
+an opt-in orphan-session watchdog, the Beat 5 feedback / reward
+loop in both the demo and the live notebook, hardened deploy
+defaults (split SAs + tunable retries), and a Terraform module
+mirroring the bash deploy. The migration-v5 cron path is now
+complete for audit-critical production deployments.
+
 ### Added
 
+- **Backfill mode for `materialize_window`** ([#188](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/188),
+  closes [#177](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/177))
+  — `bqaa-materialize-window --backfill --from / --to --state-key-suffix`
+  runs a one-shot historical window with isolated state-table
+  rows (the suffix folds into the `state_key` hash, so backfill
+  rows can't advance the steady-state cron checkpoint).
+- **Compiled-only extraction mode + deploy path** ([#192](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/192),
+  [#193](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/193),
+  closes [#178](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/178))
+  — `--extraction-mode=compiled-only` routes the orchestrator
+  through structured extractors only, never calls `AI.GENERATE`,
+  surfaces uncovered spans as typed `empty_extraction` failures
+  with sample diagnostics. The deploy script (`#193`) stages
+  `reference_extractor.py` into the container, wires
+  `BQAA_REFERENCE_EXTRACTORS_MODULE`, and makes
+  `roles/aiplatform.user` conditional (idempotently removes the
+  grant when transitioning an existing ai-fallback deploy to
+  compiled-only). `TestCompiledOnlyMakesZeroLLMCalls` proves the
+  zero-LLM contract.
+- **Explicit FK→PK mapping for binding columns** ([#191](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/191),
+  [#222](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/222),
+  closes [#179](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/179))
+  — `from_columns` / `to_columns` accept `list[dict[str, str]]`
+  shape (`[{src_decision_execution_id: id}]`) in addition to the
+  legacy `list[str]`. Materializer, validators, and the PG DDL
+  compiler consume the canonical
+  `ResolvedRelationship.from_column_mapping`. MAKO's
+  `evolvedFrom` / `supersededBy` self-edges are re-added to the
+  migration v5 binding.
+- **Orphan-session watchdog** ([#224](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/224),
+  closes [#180](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/180))
+  — opt-in via `--max-session-age-hours N`. Each cron pass scans
+  for sessions whose first event is older than the cutoff but
+  which never emitted `AGENT_COMPLETED`; flags them as
+  `session_orphaned` failures and records the running set in the
+  state table (`mode='orphan_scan'` + `mode='orphan_ledger'`
+  rows). Strict `>` watermark, explicit timestamp-bound partition
+  pruning on the resolved-orphan probe.
+- **Migration v5 Beat 5 — feedback / reward loop** ([#227](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/227),
+  [#228](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/228),
+  closes [#181](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/181),
+  [#184](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/184),
+  [#185](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/185))
+  — demo scope grows from 6 → 11 entities and 9 → 14
+  relationships. Adds `BusinessConstraint`,
+  `ConstraintApplication`, `RejectionReason`, `OutcomeSignal`,
+  `RewardComputation` + their edges. The demo agent emits four
+  new tools (`apply_constraint`, `record_rejection`,
+  `record_outcome_signal`, `compute_reward`); the reference
+  extractor covers all four; the notebook's new Beat 5 cells run
+  the two payoff GQL traversals end-to-end against a live
+  BigQuery scratch dataset (29 / 29 cells executed, counts 1–29,
+  6 unique reward rows + 8 unique rejection rows verified live).
+- **Split runtime + scheduler-caller SAs by default** ([#230](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/230),
+  closes [#182](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/182))
+  — `deploy_cloud_run_job.sh` creates two SAs by default:
+  `bqaa-periodic-runtime-sa` (BigQuery + Vertex AI roles) and
+  `bqaa-periodic-scheduler-sa` (only `roles/run.invoker` on the
+  job). `--single-sa` is the escape hatch for the pre-#182
+  combined identity. Least-privilege: scheduler-caller never
+  needs BigQuery permissions.
+- **Tunable `--max-retries` on Cloud Run Job** ([#230](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/230),
+  closes [#183](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/183))
+  — default 2 (was hard-coded 1). The orchestrator's session-
+  level idempotency + append-only state table make additional
+  retries safe. The retry count flows into `BQAA_MAX_RETRIES` on
+  the job's env so the runtime's startup log surfaces it in
+  `jsonPayload.max_retries` — operators correlating Cloud
+  Monitoring alert noise with retry behaviour see the policy
+  without `gcloud run jobs describe`.
+- **Terraform module for periodic materialization** ([#231](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/231),
+  closes [#186](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/186))
+  — `examples/migration_v5/periodic_materialization/terraform/`
+  mirrors the bash deploy's resources (graph dataset, both SAs,
+  IAM bindings, Cloud Run v2 Job, Scheduler trigger) with
+  defaults matching `deploy_cloud_run_job.sh`'s post-#230
+  surface. New `build_image.sh` helper produces the staging
+  layout the runtime needs. Image build/publish are intentionally
+  outside the module — `var.image_uri` takes the published
+  container image. `var.manage_apis` enables the required APIs
+  on a clean project; `var.deletion_protection` matches the bash
+  deploy's lifecycle. Live-verified end-to-end against
+  `test-project-0728-467323`.
+
+### Fixed
+
+- **Orphan-watchdog empty-array streaming-insert crash hotfix** ([#225](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/225))
+  — BigQuery's streaming-insert API rejects empty
+  `ARRAY<STRING>` values with `Field value of
+  flagged_session_ids cannot be empty.`. Pre-fix, every cron
+  pass after [#224](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/224)
+  crashed at insert time. Fix: omit nullable columns from the
+  `insert_rows_json` payload when their value is `None` or
+  empty.
+
+## [0.3.1] - 2026-05-18
+
+### Release highlights
+
+Focused follow-up to 0.3.0 that publishes the periodic-materialization
+production path. The `bqaa-materialize-window` CLI merged after the
+0.3.0 cut, so customers `pip install`-ing the SDK couldn't run the
+cron path the migration v5 playbook documents. 0.3.1 closes that gap
+and ships the surrounding deployment artifacts and a behavior fix:
+
+- **`bqaa-materialize-window` CLI on PyPI** ([#162](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/162))
+  — cron-friendly scheduled-graph-refresh command, available as a
+  standalone console script and as a `bq-agent-sdk materialize-window`
+  subcommand.
+- **Empty-extraction silent-failure mode closed** ([#167](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/167))
+  — `ok=true` is now an honest signal; per-session extraction
+  failures classify as `empty_extraction` vs `materialization_failed`
+  and flip `ok=false`. **Operator-visible behavior change** (see
+  Fixed).
+- **Cloud Run Job + Cloud Scheduler example** ([#165](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/165),
+  [#166](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/166))
+  — packaged deployment template under
+  `examples/migration_v5/periodic_materialization/` with
+  one-command deploy + `--smoke` end-to-end verification.
+- **Customer playbook** ([#168](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/168))
+  — the production cron path documented end-to-end: required
+  APIs/IAM, recommended schedules, JSON log shape, Cloud Monitoring
+  alerts, state-table inspection, teardown, troubleshooting.
+
+### Added
+
+- **`bqaa-materialize-window` console script** (PR
+  [#162](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/162)).
+  New cron-friendly entry point for keeping the materialized graph
+  fresh on a schedule. Shipped as a standalone console script
+  (`bqaa-materialize-window`) and as a `bq-agent-sdk
+  materialize-window` subcommand; both call paths share
+  `src/bigquery_agent_analytics/materialize_window.py`. Terminal-
+  event-driven discovery (`event_type = @completion_event_type`,
+  partition-pruned), pinned `run_started_at` snapshot, append-only
+  state table keyed on a content-derived `state_key` (project +
+  dataset + graph + events_table + ontology fingerprint + binding
+  fingerprint + discovery mode), overlap-windowed re-scan for
+  late-arriving events, per-session loop with idempotent retries
+  and checkpoint advance only on success, worst-status-wins
+  per-table aggregation, structured JSON report with C2 compiled-
+  extractor outcome counters (`compiled_unchanged` /
+  `compiled_filtered` / `fallback_for_event`), binding-validate
+  pre-flight, checkpoint that never regresses across overlap
+  re-scans, numeric/identifier guardrails at the boundary. Exit
+  codes: `0` clean, `1` expected failure (session error or
+  binding drift), `2` unexpected internal error.
+
+- **Migration v5 Cloud Run Job + Cloud Scheduler example** in
+  [`examples/migration_v5/periodic_materialization/`](examples/migration_v5/periodic_materialization/)
+  (PRs
+  [#165](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/165),
+  [#166](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/166)).
+  Packaged Cloud Run Job + Cloud Scheduler deployment that wraps
+  `bqaa-materialize-window` for the migration v5 binding. One-
+  command `deploy_cloud_run_job.sh` creates a runtime service
+  account with narrow IAM (`dataViewer` on the events dataset,
+  `dataEditor` on the graph dataset, `bigquery.jobUser` +
+  `aiplatform.user` at the project, `run.invoker` on the job for
+  the scheduler SA), deploys the job, wires the Cloud Scheduler
+  trigger, and optionally runs `--smoke` to verify end-to-end in
+  one shot. IAM matrix, dataset-role contract (events read-only,
+  graph read/write), and live-deploy evidence captured against the
+  canonical test project.
+
+- **Migration v5 periodic materialization playbook** in
+  [`examples/migration_v5/periodic_materialization/README.md`](examples/migration_v5/periodic_materialization/README.md)
+  (PR [#168](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/168)).
+  Documents the customer path for keeping the MAKO graph fresh on
+  a schedule: local dry-run via `run_job.py`, Cloud Run Job +
+  Cloud Scheduler deployment with `--smoke`, required APIs and
+  IAM, recommended schedules, Cloud Logging JSON report shape,
+  Cloud Monitoring alerts, state-table inspection, teardown, and
+  troubleshooting. Complements the migration v5 four-guarantee
+  notebook by covering the production cron path.
+
+### Fixed
+
+- **`materialize-window` no longer reports `ok=true` on silent
+  extraction failures** (PR
+  [#167](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/167)).
+  Previously, when per-event extraction returned an empty graph
+  (e.g., runtime SA missing `roles/aiplatform.user` so every
+  `AI.GENERATE` call failed and was swallowed), the orchestrator
+  reported `sessions_materialized == sessions_discovered`,
+  `ok=true`, and an empty `rows_materialized` dict. Operators
+  alerting on `jsonPayload.ok` saw "all good" while the entity
+  tables stayed empty. Now, after `materialize_with_status`
+  succeeds, the orchestrator inspects the materialized rows and
+  per-table statuses; sessions producing zero materialized rows
+  break the loop and classify the failure as
+  `empty_extraction` (extraction returned empty — check AI/IAM)
+  or `materialization_failed` (extraction produced rows but every
+  insert failed — check write perms / schema). `ok=false` is the
+  unmistakable red signal, and `failures[].error_code`
+  distinguishes the failure mode without log digging. Per-table
+  statuses now also surface in `result.table_statuses` for
+  failed sessions (previously only `ok` sessions contributed).
+  **Operator-visible behavior change**: alerts on
+  `jsonPayload.ok=false` are sufficient; no second-line
+  `rows_materialized == {}` check needed. The empty-window
+  heartbeat path (`sessions_discovered == 0`) is unchanged — an
+  idle cron firing still reports `ok=true`.
+
+## [0.3.0] - 2026-05-15
+
+### Release highlights
+
+Substantial feature release covering three major workstreams that landed
+between 0.2.3 and 0.3.0:
+
+- **Compiled structured extractors — full Phase C pipeline**
+  ([#75](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/75))
+  — deterministic source generation, JSON-to-plan parsing, LLM-driven plan
+  resolution, retry-on-gate-failure orchestration, runtime fallback wiring,
+  runtime extractor-registry adapter, orchestrator call-site swap,
+  compile-and-measure utility, revalidation harness, BigQuery-table bundle
+  mirror, ``bqaa-revalidate-extractors`` CLI with ``--events-bq-query-file``,
+  and an operational rollout guide. Replaces per-event LLM extraction with
+  deterministic code on the hot path while preserving the LLM fallback for
+  unrecognized event shapes.
+- **Ontology runtime reader**
+  ([#58](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/58)
+  reader follow-on to PR #92's concept-index emission) —
+  ``OntologyRuntime`` façade, ``EntityResolver`` Protocol with two reference
+  implementations (``ExactEntityResolver``, ``LabelSynonymResolver``), and
+  ``ConceptIndexLookup`` with fingerprint-strict verification across three
+  trust points (eager ``verify()`` at construction, explicit re-checks,
+  per-query ``WHERE compile_fingerprint`` defense in depth). Stable failure
+  codes (``FingerprintMismatchError``, ``MetaTableMissingError``,
+  ``MetaTableEmptyError``, ``MetaTableMultipleRowsError``).
+- **Binding + extraction validation toolkit**
+  ([#76](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/76),
+  [#105](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/105))
+  — ``validate_extracted_graph(...)``,
+  ``validate_extracted_graph_from_ontology(...)``,
+  ``validate_binding_against_bigquery(...)`` Python APIs;
+  ``bq-agent-sdk binding-validate`` CLI for pre-flight validation;
+  ``ontology-build --validate-binding`` and ``--location`` flags.
+
+Examples shipped alongside the SDK release: the MAKO four-guarantee notebook
+demonstrating the compiled-extractor pipeline end-to-end
+([#107](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/107)),
+and the A2A joint-lineage demo with auditor projections, the receiver
+``A2A_INTERACTION`` typed view, and an audit-analyst agent that closes the
+BQAA loop
+([#129](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/129)).
+
+### Added
+
+- **``A2A_INTERACTION`` typed view (``adk_a2a_interactions``)** in
+  ``src/bigquery_agent_analytics/views.py`` (PR
+  [#136](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/136)).
+  Surfaces the BQ AA Plugin's caller-side A2A delegation rows
+  with JSON-extracted lineage columns —
+  ``a2a_task_id``, ``a2a_context_id``, ``a2a_request``,
+  ``a2a_response``, plus a ``receiver_session_id_from_response``
+  COALESCE — so downstream consumers can join caller and receiver
+  traces without writing the JSON-extraction SQL by hand. Used by
+  the A2A joint-lineage demo's auditor projection.
+- **``CodeEvaluator.context_cache_hit_rate(...)`` + CLI support**
+  (PR [#114](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/114)).
+  New pre-built evaluator in
+  ``src/bigquery_agent_analytics/evaluators.py`` that measures
+  Gemini context-cache prefix-hit rate
+  (``cached_tokens / input_tokens``) per session, with
+  cold-start / warm rate thresholds and an explicit
+  ``fail_on_missing_telemetry`` switch. Wired through the
+  ``bqaa evaluate --evaluator context_cache_hit_rate`` CLI path
+  (``src/bigquery_agent_analytics/cli.py``).
+- **``gm compile --emit-concept-index`` / ``--concept-index-table``**
+  CLI flags in ``src/bigquery_ontology/cli.py`` (PR
+  [#92](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/92),
+  issue
+  [#58](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/58)
+  Phase 1). Emits a fingerprint-stamped concept-index table
+  (``label`` / ``synonym`` / ``notation`` rows + ``__meta``)
+  that the ontology runtime reader (above) verifies against.
+  ``--concept-index-table`` is required when ``--emit-concept-index``
+  is set — no silent global default.
+- **``ontology-build --skip-property-graph``** flag in
+  ``src/bigquery_agent_analytics/cli.py`` (PR
+  [#108](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/108),
+  issue
+  [#104](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/104)).
+  Materializes node and edge tables without issuing the
+  ``CREATE OR REPLACE PROPERTY GRAPH`` statement, letting users
+  own their property-graph DDL while still letting the SDK
+  populate the backing tables.
+- **Ontology runtime reader** in
+  ``bigquery_agent_analytics.ontology_runtime`` and
+  [`docs/ontology_runtime_reader.md`](docs/ontology_runtime_reader.md).
+  Issue [#58](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/58)
+  reader follow-on to PR #92's concept-index emission.
+  Public surface:
+  * ``OntologyRuntime`` — façade that loads
+    ``Ontology + Binding`` (from YAML files or in-memory
+    models) plus an optional :class:`ConceptIndexLookup`
+    wired to the emitted BigQuery table. Read-only
+    accessors over entities / relationships / synonyms /
+    annotations / SKOS schemes / notations / labels;
+    provenance properties (``compile_fingerprint`` /
+    ``compile_id``) computed locally.
+  * ``EntityResolver`` Protocol + two reference
+    implementations: ``ExactEntityResolver`` (in-memory
+    match on ``entity_name``, no BQ roundtrip) and
+    ``LabelSynonymResolver`` (BQ-backed match against the
+    concept-index ``label`` / ``synonym`` / ``notation``
+    rows, re-ranked by label-kind priority
+    ``name > pref > alt > hidden > synonym > notation``).
+    **No embedding / LLM / fuzzy in this slice** — explicit
+    non-goals; future PRs can implement the Protocol
+    without touching the runtime surface.
+  * ``ConceptIndexLookup`` — BigQuery-backed accessor that
+    is **fingerprint-strict**. Three trust points: eager
+    ``verify()`` at construction (compares the table's
+    ``__meta`` row against the locally-computed
+    ``compile_fingerprint(ontology_fp, binding_fp,
+    compiler_version)``); explicit ``verify()`` method for
+    re-checks before long batches; per-query
+    ``WHERE compile_fingerprint = @expected_fp`` as defense
+    in depth so stale rows can't surface even mid-flight.
+    Three lookup methods: ``lookup_by_label`` (with
+    label-kind / language / case-insensitive filters),
+    ``lookup_by_entity_name``, ``lookup_by_notation``.
+    Stable failure codes: ``FingerprintMismatchError``,
+    ``MetaTableMissingError``, ``MetaTableEmptyError``,
+    ``MetaTableMultipleRowsError`` — all subclass
+    ``ConceptIndexError``.
+  CI suite (55 cases) uses in-memory fake BQ clients;
+  live test (gated behind ``BQAA_RUN_LIVE_ONTOLOGY_RUNTIME_TESTS=1``)
+  emits a real concept-index via PR #92's path, attaches
+  the runtime, runs resolver queries against the live
+  table, asserts provenance, drops the tables on the way
+  out. Closes the last feature dependency for #107's
+  four-guarantee notebook (the resolve beat).
+- **Compiled-extractor rollout guide** at
+  [`docs/extractor_compilation_rollout_guide.md`](docs/extractor_compilation_rollout_guide.md).
+  Operational playbook for the Phase C pipeline (issue
+  [#75](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/75))
+  stitching the five stages — Compile, Publish, Sync, Wire,
+  Revalidate — into one flow. Treats Publish/Sync as the
+  remote-runtime path; local / co-located deployments can
+  shortcut to Compile → Wire → Revalidate. Worked BKA
+  example uses Python snippets for the non-CLI stages
+  (``measure_compile``, ``publish_bundles_to_bq``,
+  ``sync_bundles_from_bq``,
+  ``OntologyGraphManager.from_bundles_root``) and the real
+  ``bqaa-revalidate-extractors`` shell invocation only
+  where a CLI actually exists. Documents the **four trust
+  gates** across the pipeline — the compile-time smoke gate
+  inside ``compile_extractor`` (``load_callable_from_source``
+  + ``run_smoke_test``, not ``load_bundle`` itself: there's
+  no manifest at compile time) plus three real
+  ``load_bundle`` runs at pre-publish, post-sync, and
+  runtime-startup discovery — so the trust model is one
+  mental model across the pipeline.
+  Includes a failure-recovery playbook keyed on the stable
+  failure codes each stage emits.
+- **``--events-bq-query-file`` for ``bqaa-revalidate-extractors``**
+  (issue [#75](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/75)
+  CLI follow-up). The CLI now accepts a BigQuery event
+  source in addition to ``--events-jsonl``; the two are
+  mutually exclusive and exactly one must be supplied.
+  Contract: the SQL must produce exactly one column named
+  ``event_json`` (STRING) per row, containing a JSON-encoded
+  event dict — same shape ``--events-jsonl`` consumes
+  line-by-line. The CLI does NOT auto-shape
+  ``bigquery.Row`` objects; the query writer controls
+  projection via ``TO_JSON_STRING(STRUCT(...))``. Row-level
+  errors (missing column, non-string value, malformed JSON,
+  non-dict decode) surface as exit 2 with the 0-based row
+  index named so an operator can find the offender with
+  ``LIMIT N OFFSET row_index``. BigQuery-side exceptions
+  (auth, syntax, table-not-found, permission) are caught and
+  surfaced with type + message — no traceback escapes.
+  ``--bq-project`` is optional: the BigQuery client falls
+  back to Application Default Credentials / environment for
+  project inference; if both are absent the CLI exits 2 with
+  ``Set --bq-project explicitly`` rather than confusing the
+  operator with a downstream API error. ``--bq-location``
+  defaults to ``US``. Client construction is centralized
+  behind ``_make_bq_client(project, location)`` so unit
+  tests inject in-memory fakes via ``monkeypatch.setattr``
+  rather than wiring through every call site. CI tests
+  (11 new cases) cover the happy path, ADC inference,
+  no-project-anywhere, query exceptions, every row-shape
+  failure mode, the mutex on event sources (both / neither),
+  and the empty-SQL-file edge. Live BQ test
+  (``tests/test_extractor_compilation_cli_revalidate_bq_live.py``)
+  is gated behind ``BQAA_RUN_LIVE_BQ_REVALIDATE_TESTS=1``;
+  it creates a temp table, inserts two ``event_json`` rows,
+  runs the CLI, asserts the report is written with both
+  events as compiled_unchanged + parity_matches, deletes
+  the table on the way out.
+- **``bqaa-revalidate-extractors`` CLI** in
+  `bigquery_agent_analytics.extractor_compilation.cli_revalidate`
+  and
+  [`docs/extractor_compilation_revalidate_cli.md`](docs/extractor_compilation_revalidate_cli.md).
+  Issue [#75](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/75)
+  follow-up to Milestone C2.d — operationalizes
+  ``revalidate_compiled_extractors`` so ops can run periodic
+  revalidation without writing Python. **Local inputs
+  only** this round; ``--events-bq-query`` lands in a
+  follow-up so the auth/location/pagination surface gets
+  isolated from the operational-loop contract.
+  Flags: ``--bundles-root`` (auto-detects the fingerprint
+  from the first bundle's manifest; mixed fingerprints
+  fail-closed), ``--events-jsonl`` (one event per line,
+  malformed lines abort with line number), ``--reference-
+  extractors-module`` (dotted path; module exposes
+  ``EXTRACTORS: dict[str, callable]``, ``RESOLVED_GRAPH``
+  from ``resolve(ontology, binding)``, and optionally
+  ``SPEC`` — the CLI carries no ontology/binding flags
+  because the reference module owns the validator-input
+  contract), ``--thresholds-json`` (optional; JSON object
+  with any subset of ``RevalidationThresholds`` fields,
+  bounds-checked via the existing ``__post_init__``),
+  ``--report-out`` (combined JSON of the raw
+  ``RevalidationReport`` plus the ``ThresholdCheckResult``).
+  Exit codes are deliberately narrow: ``0`` pass / ``1``
+  threshold violation (report still written) / ``2``
+  usage-or-input error (report not written). Wired through
+  ``pyproject.toml [project.scripts]`` so
+  ``pip install`` exposes the binary.
+- **BigQuery-table bundle mirror** in
+  `bigquery_agent_analytics.extractor_compilation.bq_bundle_mirror`
+  and
+  [`docs/extractor_compilation_bq_bundle_mirror.md`](docs/extractor_compilation_bq_bundle_mirror.md).
+  Issue [#75](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/75)
+  PR C2.c.3 — publishes compiled bundles to a BigQuery
+  table and syncs them back into a local directory for
+  C2.a's existing loader. Runtime path stays
+  ``sync_bundles_from_bq → discover_bundles →
+  from_bundles_root``; the mirror is a utility, not a
+  runtime loader. Public surface:
+  ``publish_bundles_to_bq(bundle_root, store,
+  bundle_fingerprint_allowlist=None)`` and
+  ``sync_bundles_from_bq(store, dest_dir,
+  bundle_fingerprint_allowlist=None)``. Both call
+  :func:`load_bundle` as a gate — publish refuses bundles
+  that wouldn't load at the runtime; sync refuses bundles
+  whose reconstruction the loader rejects, scrubbing any
+  partial directory it wrote. Sync writes each
+  fingerprint to a side-by-side **staging directory** and
+  runs ``load_bundle`` on the staged copy before performing
+  a **staged replace** of the target (the rmtree+move pair
+  is not strictly atomic — a crash between the two leaves
+  the bundle absent on disk, recoverable by re-sync — but
+  the load-bundle-failure direction *is* atomic, so a bad
+  mirror row never destroys a previously-good local
+  bundle).
+  Strict bundle-shape check: the table stores exactly two
+  rows per fingerprint (``manifest.json`` + the manifest's
+  ``module_filename``); ``unexpected_file`` codes reject
+  anything else. The manifest's own ``module_filename`` is
+  shape-checked at sync (bare filename — no separators, no
+  ``..``, no NUL); a path-separator value surfaces as
+  ``manifest_row_unreadable`` instead of raising
+  ``FileNotFoundError`` at the write step.
+  ``invalid_bundle_path`` rejects traversal / absolute /
+  backslash / NUL paths before writing to disk.
+  ``duplicate_row`` rejects two rows sharing the same
+  ``(fingerprint, bundle_path)`` (BigQuery has no unique
+  constraint; the mirror enforces uniqueness at sync).
+  ``duplicate_fingerprint`` rejects publish-side cases
+  where two subdirs of ``bundle_root`` claim the same
+  manifest fingerprint — neither is published, so the
+  table can't end up with logical duplicates.
+  ``malformed_row`` rejects rows with wrong field types.
+  Idempotent republish via DELETE+INSERT in
+  ``BigQueryBundleStore.publish_rows`` —
+  re-publishing the same fingerprint replaces the prior
+  rows rather than accumulating duplicates. The DELETE +
+  ``insert_rows_json`` are NOT a single atomic
+  transaction; a transient INSERT failure leaves rows
+  missing until the caller re-runs publish (recoverable;
+  documented in the class docstring).
+  ``publish_rows`` also raises ``ValueError`` on duplicate
+  ``(fingerprint, bundle_path)`` input pairs as defense in
+  depth.
+  ``BundleStore`` is a Protocol so tests can pass in-memory
+  fakes; ``BigQueryBundleStore`` is the concrete
+  implementation wrapping ``google.cloud.bigquery``.
+  ``BUNDLE_MIRROR_TABLE_SCHEMA`` is exported for callers
+  who need to create the table themselves (or
+  ``BigQueryBundleStore.ensure_table()`` does it
+  idempotently). Failure codes are stable strings;
+  per-bundle problems land in ``failures`` instead of
+  raising. Store exceptions (BQ-side: network, auth, table
+  missing) propagate. Out of scope: GCS-backed signed-URL
+  fetch, caching / TTL, garbage collection, multi-region
+  replication.
+- **Revalidation harness for compiled structured extractors**
+  in
+  `bigquery_agent_analytics.extractor_compilation.revalidation`
+  and
+  [`docs/extractor_compilation_revalidation.md`](docs/extractor_compilation_revalidation.md).
+  Issue [#75](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/75)
+  PR C2.d — turns the compiled path from "works in tests" into
+  "keeps proving itself after rollout." Public surface:
+  ``revalidate_compiled_extractors(events,
+  compiled_extractors, reference_extractors, resolved_graph,
+  ...)`` drives ``run_with_fallback`` (with a no-op fallback)
+  over a batch of events AND calls the reference extractor
+  directly, aggregating the per-event outcomes into a
+  ``RevalidationReport`` with **two orthogonal dimensions**:
+  (1) runtime decision — per-event-type ``EventTypeCounts``
+  plus totals for ``compiled_unchanged`` /
+  ``compiled_filtered`` / ``fallback_for_event``, with
+  ``compiled_path_faults`` split out so bundle bugs (the
+  wrapper's ``compiled_exception`` audit field covers
+  exceptions, wrong return type, and malformed result
+  internals) are distinguishable from ontology drift; (2)
+  agreement against reference — ``parity_matches`` /
+  ``parity_divergences`` / ``parity_not_checked`` using a
+  three-comparator parity check: ``_compare_nodes`` and
+  ``_compare_span_handling`` from ``measurement.py`` plus
+  ``_compare_edges`` in ``revalidation.py`` (same edge_id
+  set with matching relationship_name / endpoints / property-
+  set per shared edge; duplicate edge_ids on either side
+  reported as a divergence rather than silently collapsed by
+  dict keying, since #76 doesn't enforce edge-id
+  uniqueness). The parity dimension catches **schema-valid
+  but semantically wrong** outputs the validator would
+  silently accept. **Every failure mode on the reference
+  side becomes a parity divergence, never a batch abort**:
+  exceptions, non-``StructuredExtractionResult`` returns
+  (including ``None``), and comparator crashes all funnel
+  into the divergence channel with a descriptive string. Headline KPIs:
+  ``compiled_unchanged_rate`` (schema safety) and
+  ``parity_match_rate`` (semantic agreement; denominator
+  excludes ``parity_not_checked`` so wrapper-filtered events
+  don't conflate with wrong-output events). Sample
+  divergences are capped (per-dimension, independently) at 10
+  by default. Skipped events (event_types without a compiled
+  or reference extractor, malformed events) are counted
+  separately from the rate denominators.
+  ``check_thresholds(report, RevalidationThresholds(...))``
+  evaluates the same report against policy gates;
+  ``RevalidationThresholds`` validates rates are in
+  ``[0, 1]`` (and rejects NaN / bool) at construction so a
+  typo like ``max_fallback_for_event_rate=5`` fails loud
+  instead of silently disabling the gate. Multiple
+  thresholds all evaluated (no short-circuit), violations as
+  human-readable strings naming the failed rate and bound.
+  ``RevalidationReport.to_json()`` is deterministic for
+  persistence + cross-run diffing. Out of scope (deferred):
+  scheduled / cron orchestration, BigQuery / disk
+  persistence, CLI binary, sampling strategy, auto-fix
+  workflows.
 - **Orchestrator call-site swap for compiled structured
   extractors** in
   `bigquery_agent_analytics.ontology_graph.OntologyGraphManager`

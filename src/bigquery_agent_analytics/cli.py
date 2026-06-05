@@ -51,6 +51,33 @@ app = typer.Typer(
     add_completion=False,
 )
 
+# Product-facing CLI surface. Wraps the same handlers that ``bq-agent-sdk``
+# exposes under their implementation-shaped names, but presents them with
+# product-aligned vocabulary (``context-graph`` for the materialization
+# pass, etc.). New customer-facing commands should be added here.
+bqaa_app = typer.Typer(
+    name="bqaa",
+    help=(
+        "BigQuery Agent Analytics — product-facing CLI surface for building"
+        " and refreshing the BigQuery context graph that traces your AI"
+        " agent's decisions."
+    ),
+    add_completion=False,
+    no_args_is_help=True,
+)
+
+
+@bqaa_app.callback()
+def _bqaa_callback() -> None:
+  """BigQuery Agent Analytics — product-facing CLI.
+
+  The ``@callback`` keeps Typer from auto-promoting a single
+  subcommand's options to the top level. Without it, ``bqaa --help``
+  would show the ``context-graph`` flags directly instead of the
+  subcommand list.
+  """
+  return None
+
 
 # ------------------------------------------------------------------ #
 # Shared options                                                       #
@@ -1735,9 +1762,463 @@ def views_create(
     raise typer.Exit(code=2)
 
 
+# ------------------------------------------------------------------ #
+# materialize-window (cron-friendly graph refresh)                     #
+# ------------------------------------------------------------------ #
+
+
+def _validate_context_graph_input_mode(
+    ontology_path: Optional[str],
+    binding_path: Optional[str],
+    property_graph_path: Optional[str],
+) -> None:
+  """Enforce exactly one input mode for the graph-refresh command.
+
+  Exactly one of (``--ontology`` + ``--binding``) or ``--property-graph`` must
+  be supplied. Raises ``typer.BadParameter`` (rendered as a usage error)
+  otherwise. Kept as a pure helper so the rule is unit-tested directly rather
+  than through brittle assertions on rendered CLI output.
+  """
+  has_separated = ontology_path is not None or binding_path is not None
+  if property_graph_path is not None and has_separated:
+    raise typer.BadParameter(
+        "Use either --property-graph or --ontology/--binding, not both."
+    )
+  if property_graph_path is None and (
+      ontology_path is None or binding_path is None
+  ):
+    raise typer.BadParameter(
+        "Provide --property-graph PATH, or both --ontology PATH and"
+        " --binding PATH."
+    )
+
+
+@app.command("materialize-window")
+def materialize_window(
+    project_id: str = typer.Option(
+        ..., envvar="BQ_AGENT_PROJECT", help=_PROJECT_HELP
+    ),
+    dataset_id: str = typer.Option(
+        ..., envvar="BQ_AGENT_DATASET", help="BigQuery dataset."
+    ),
+    ontology_path: Optional[str] = typer.Option(
+        None,
+        "--ontology",
+        help=(
+            "Path to ontology YAML file. Use with --binding, or omit both and"
+            " pass --property-graph to derive them from the graph DDL."
+        ),
+    ),
+    binding_path: Optional[str] = typer.Option(
+        None,
+        "--binding",
+        help="Path to binding YAML file (use with --ontology).",
+    ),
+    property_graph_path: Optional[str] = typer.Option(
+        None,
+        "--property-graph",
+        help=(
+            "Path to a CREATE PROPERTY GRAPH .sql file. Derives the ontology"
+            " and binding from the graph definition + table schemas, so no"
+            " hand-written ontology.yaml/binding.yaml is needed. Mutually"
+            " exclusive with --ontology/--binding."
+        ),
+    ),
+    events_table: str = typer.Option(
+        "agent_events",
+        "--events-table",
+        help="Source telemetry table name (in --dataset-id).",
+    ),
+    lookback_hours: float = typer.Option(
+        ...,
+        "--lookback-hours",
+        help=(
+            "Hard upper bound on how far back to discover sessions. "
+            "Combined with the state-table checkpoint and --overlap-"
+            "minutes to compute the actual scan window."
+        ),
+    ),
+    overlap_minutes: float = typer.Option(
+        15.0,
+        "--overlap-minutes",
+        help=(
+            "Re-process events newer than (last_checkpoint - "
+            "overlap_minutes). Catches late-arriving rows. Session-"
+            "level idempotency keeps re-runs safe."
+        ),
+    ),
+    completion_event_type: str = typer.Option(
+        "AGENT_COMPLETED",
+        "--completion-event-type",
+        help=(
+            "Treat sessions as done when this event_type appears in "
+            "--events-table. Parameterized so non-BQ-AA-plugin "
+            "emitters aren't locked out."
+        ),
+    ),
+    include_active_sessions: bool = typer.Option(
+        False,
+        "--include-active-sessions",
+        help=(
+            "Drop the completion-event filter and materialize every "
+            "session seen in the window. Partial coverage; useful "
+            "for debugging, not production."
+        ),
+    ),
+    state_table: Optional[str] = typer.Option(
+        None,
+        "--state-table",
+        help=(
+            "Checkpoint table reference. Default: "
+            "{project}.{dataset}._bqaa_materialization_state. Accepts "
+            "table / dataset.table / project.dataset.table."
+        ),
+    ),
+    graph_name: Optional[str] = typer.Option(
+        None,
+        "--graph-name",
+        help="Property-graph name. Default: binding's ontology field.",
+    ),
+    bundles_root: Optional[str] = typer.Option(
+        None,
+        "--bundles-root",
+        envvar="BQAA_BUNDLES_ROOT",
+        help=(
+            "Compiled-bundle directory. When set, the runtime "
+            "registry routes events through compiled bundles with "
+            "validator-gated fallback to --reference-extractors-"
+            "module."
+        ),
+    ),
+    reference_extractors_module: Optional[str] = typer.Option(
+        None,
+        "--reference-extractors-module",
+        help=(
+            "Dotted module path exposing EXTRACTORS dict. Required "
+            "when --bundles-root is set."
+        ),
+    ),
+    max_sessions: Optional[int] = typer.Option(
+        None,
+        "--max-sessions",
+        help="Hard cap on sessions per run (cost guardrail).",
+    ),
+    location: Optional[str] = typer.Option(
+        None, "--location", help="BigQuery location (e.g. 'US', 'EU')."
+    ),
+    validate_binding: bool = typer.Option(
+        True,
+        "--validate-binding/--no-validate-binding",
+        help=(
+            "Pre-flight binding-validate against live BQ tables "
+            "before extraction. The 'fail before AI.GENERATE "
+            "spend' contract from #161. Default on. Skipped on "
+            "--dry-run regardless."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help=(
+            "Discover sessions but don't extract, validate, or "
+            "materialize. Writes no state-table row."
+        ),
+    ),
+    backfill: bool = typer.Option(
+        False,
+        "--backfill",
+        help=(
+            "Backfill mode: re-materialize a fixed historical window "
+            "given by --from / --to without reading or advancing the "
+            "steady-state checkpoint. REQUIRES --state-key-suffix so "
+            "the backfill's state rows occupy a distinct state_key "
+            "namespace from the steady-state cron — without a suffix "
+            "the backfill row would later be read as the cron's "
+            "checkpoint and silently rewind the high-water mark."
+        ),
+    ),
+    from_time: Optional[str] = typer.Option(
+        None,
+        "--from",
+        help=(
+            "Backfill window lower bound, inclusive. UTC ISO 8601 "
+            "(e.g. 2026-05-01T00:00:00Z). Required when --backfill."
+        ),
+    ),
+    to_time: Optional[str] = typer.Option(
+        None,
+        "--to",
+        help=(
+            "Backfill window upper bound, exclusive. UTC ISO 8601 "
+            "(e.g. 2026-05-08T00:00:00Z). Required when --backfill."
+        ),
+    ),
+    state_key_suffix: Optional[str] = typer.Option(
+        None,
+        "--state-key-suffix",
+        help=(
+            "Optional suffix folded into the state-key SHA. Use to "
+            "isolate backfill / re-extraction runs from the steady-"
+            "state cron so their state rows never advance the live "
+            "checkpoint. Treat as a stable name (e.g. "
+            "'backfill-may-w1') — changing it produces a new "
+            "state_key and a fresh checkpoint stream."
+        ),
+    ),
+    extraction_mode: str = typer.Option(
+        "ai-fallback",
+        "--extraction-mode",
+        help=(
+            "Extraction path for each session's events. "
+            "'ai-fallback' (default) — structured extractors run "
+            "and AI.GENERATE fills any gaps; existing behavior. "
+            "'compiled-only' — structured extractors only; no AI "
+            "call; unhandled spans surface as typed "
+            "'empty_extraction' failures with sample diagnostics. "
+            "Pick 'compiled-only' to drop roles/aiplatform.user "
+            "from the runtime SA (no LLM calls under this mode, "
+            "asserted by SDK tests)."
+        ),
+    ),
+    max_session_age_hours: Optional[float] = typer.Option(
+        None,
+        "--max-session-age-hours",
+        help=(
+            "Enable the orphan-session watchdog (issue #180). When "
+            "set, the orchestrator additionally scans for sessions "
+            "whose first event is older than N hours but which "
+            "never emitted the completion event. Each new orphan "
+            "surfaces as a typed 'session_orphaned' failure in the "
+            "JSON report; the state table records per-scan "
+            "(mode='orphan_scan') and cumulative "
+            "(mode='orphan_ledger') audit rows under the same "
+            "state_key. Disabled by default; skipped in --backfill "
+            "mode."
+        ),
+    ),
+    fmt: str = typer.Option(
+        "json",
+        "--format",
+        help="Output format: json|text|table.",
+    ),
+) -> None:
+  """Time-window-driven graph refresh.
+
+  Discover sessions whose terminal event landed in
+  ``[scan_start, scan_end)``, extract each session's full history,
+  and materialize. Append-only state table tracks the high-water
+  mark so subsequent runs pick up where the last left off.
+
+  Exit codes:
+      0 — every discovered session materialized cleanly.
+      1 — expected failure. Either at least one session failed
+          (partial result; checkpoint advanced only to the last
+          successful session) OR --validate-binding detected
+          schema drift against live BigQuery before extraction
+          (no sessions materialized; drift recorded in the state
+          table audit trail).
+      2 — unexpected internal error (load failure, missing flag,
+          programming bug).
+  """
+  # Validate the input mode before any work: exactly one of
+  # (--ontology + --binding) or (--property-graph).
+  _validate_context_graph_input_mode(
+      ontology_path, binding_path, property_graph_path
+  )
+
+  try:
+    from .materialize_window import _parse_backfill_timestamp
+    from .materialize_window import run_materialize_window
+
+    # Parse --from / --to at the CLI boundary. Empty strings are
+    # treated as "unset" so an env-var pass-through that passes
+    # the empty default through doesn't accidentally flip the
+    # backfill validator. The materializer's own validator then
+    # enforces the required-when-backfill contract.
+    parsed_from = _parse_backfill_timestamp("--from", from_time)
+    parsed_to = _parse_backfill_timestamp("--to", to_time)
+
+    result = run_materialize_window(
+        project_id=project_id,
+        dataset_id=dataset_id,
+        ontology_path=ontology_path,
+        binding_path=binding_path,
+        property_graph_path=property_graph_path,
+        events_table=events_table,
+        lookback_hours=lookback_hours,
+        overlap_minutes=overlap_minutes,
+        completion_event_type=completion_event_type,
+        include_active_sessions=include_active_sessions,
+        state_table=state_table,
+        graph_name=graph_name,
+        bundles_root=bundles_root,
+        reference_extractors_module=reference_extractors_module,
+        max_sessions=max_sessions,
+        location=location,
+        validate_binding=validate_binding,
+        dry_run=dry_run,
+        backfill=backfill,
+        from_time=parsed_from,
+        to_time=parsed_to,
+        extraction_mode=extraction_mode,
+        state_key_suffix=state_key_suffix,
+        max_session_age_hours=max_session_age_hours,
+    )
+    typer.echo(format_output(result.to_json(), fmt))
+    if not result.ok:
+      raise typer.Exit(code=1)
+  except typer.Exit:
+    raise
+  except Exception as exc:  # noqa: BLE001
+    typer.echo(f"Error: {exc}", err=True)
+    raise typer.Exit(code=2)
+
+
+# Register the same ``materialize_window`` callback as the
+# ``context-graph`` subcommand on the product-facing ``bqaa`` app.
+# Both ``bq-agent-sdk materialize-window`` and ``bqaa context-graph``
+# now reach the identical implementation. The latter is the
+# product-facing name; the former is preserved for backward
+# compatibility with the internal developer workflow.
+bqaa_app.command(
+    "context-graph",
+    help=(
+        "Build or refresh the BigQuery context graph from agent events."
+        " Scans the configured event window, extracts entities and"
+        " relationships per session, and materializes the graph tables."
+    ),
+)(materialize_window)
+
+
+@bqaa_app.command("seed-events")
+def seed_events(
+    project_id: str = typer.Option(
+        ..., envvar="BQ_AGENT_PROJECT", help=_PROJECT_HELP
+    ),
+    dataset_id: str = typer.Option(
+        ..., envvar="BQ_AGENT_DATASET", help=_DATASET_HELP
+    ),
+    events_table: str = typer.Option(
+        "agent_events",
+        "--events-table",
+        help="Destination telemetry table name (in --dataset-id).",
+    ),
+    sessions: Optional[int] = typer.Option(
+        None,
+        "--sessions",
+        help=(
+            "Number of synthetic sessions (>= 1). Default depends on"
+            " --scenario: 5 for decision, 100 for decision-realistic."
+        ),
+    ),
+    seed: Optional[int] = typer.Option(
+        None,
+        "--seed",
+        help=(
+            "Seed for deterministic IDs/content. Timestamps remain anchored to"
+            " run time unless using the SDK with an injected now."
+        ),
+    ),
+    scenario: str = typer.Option(
+        "decision",
+        "--scenario",
+        help=(
+            "Synthetic scenario: decision (small, default) or"
+            " decision-realistic (100-session, multi-day, mixed outcomes)."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Generate and report events without creating the table or inserting.",
+    ),
+    fmt: str = typer.Option(
+        "json", "--format", help="Output format: json|text|table."
+    ),
+) -> None:
+  """Seed a dataset with synthetic agent_events for the context graph.
+
+  Generates decision telemetry (TOOL_COMPLETED + AGENT_COMPLETED) so
+  ``bqaa context-graph`` has sessions to process. The ``decision`` scenario
+  emits only terminal-event-closed sessions; ``decision-realistic`` also
+  includes failed, truncated, and orphaned (no terminal event) sessions.
+
+  Exit codes:
+      0 — events generated (and inserted, unless --dry-run).
+      1 — BigQuery returned insert errors (reported in the JSON output).
+      2 — invalid input or unexpected internal error.
+  """
+  try:
+    from .seed_events import run_seed_events
+
+    result = run_seed_events(
+        project_id=project_id,
+        dataset_id=dataset_id,
+        sessions=sessions,
+        seed=seed,
+        scenario=scenario,
+        events_table=events_table,
+        dry_run=dry_run,
+    )
+    typer.echo(format_output(result.to_json(), fmt))
+    if not result.ok:
+      raise typer.Exit(code=1)
+  except typer.Exit:
+    raise
+  except Exception as exc:  # noqa: BLE001
+    typer.echo(f"Error: {exc}", err=True)
+    raise typer.Exit(code=2)
+
+
 def main() -> None:
   """Entry point for ``bq-agent-sdk``."""
   app()
+
+
+def bqaa_main() -> None:
+  """Entry point for the product-facing ``bqaa`` console script."""
+  bqaa_app()
+
+
+_DEPRECATION_NOTICE = (
+    "DeprecationWarning: 'bqaa-materialize-window' is deprecated and will"
+    " be removed in a future release. Use 'bqaa context-graph' with the"
+    " same flags instead."
+)
+
+
+def _print_deprecation_warning() -> None:
+  """Print the ``bqaa-materialize-window`` deprecation notice to stderr.
+
+  Extracted from ``_materialize_window_entry`` for testability.
+  """
+  print(_DEPRECATION_NOTICE, file=sys.stderr)
+
+
+def _materialize_window_entry() -> None:
+  """Deprecated entry point for the standalone ``bqaa-materialize-window``
+  console script.
+
+  Prints a one-line deprecation notice to stderr, then invokes the same
+  handler the ``bqaa context-graph`` subcommand uses. Behavior is
+  otherwise unchanged so existing deploy scripts, Terraform modules,
+  and CI pipelines that already shell out to ``bqaa-materialize-window``
+  keep working through the deprecation window.
+
+  Builds a Click command directly from the ``materialize_window``
+  callback so ``--help`` renders as
+  ``Usage: bqaa-materialize-window [OPTIONS]`` — collapsed, no
+  nested subcommand.
+  """
+  from typer.main import get_command_from_info
+  from typer.models import CommandInfo
+
+  _print_deprecation_warning()
+  info = CommandInfo(name=None, callback=materialize_window)
+  click_cmd = get_command_from_info(
+      info, pretty_exceptions_short=True, rich_markup_mode=None
+  )
+  click_cmd()
 
 
 if __name__ == "__main__":

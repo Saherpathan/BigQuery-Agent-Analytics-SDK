@@ -42,6 +42,15 @@ from __future__ import annotations
 from .ast_validator import AstFailure
 from .ast_validator import AstReport
 from .ast_validator import validate_source
+from .bq_bundle_mirror import BigQueryBundleStore
+from .bq_bundle_mirror import BUNDLE_MIRROR_TABLE_SCHEMA
+from .bq_bundle_mirror import BundleRow
+from .bq_bundle_mirror import BundleStore
+from .bq_bundle_mirror import MirrorFailure
+from .bq_bundle_mirror import publish_bundles_to_bq
+from .bq_bundle_mirror import PublishResult
+from .bq_bundle_mirror import sync_bundles_from_bq
+from .bq_bundle_mirror import SyncResult
 from .bundle_loader import discover_bundles
 from .bundle_loader import DiscoveryResult
 from .bundle_loader import load_bundle
@@ -72,6 +81,12 @@ from .retry_loop import build_retry_prompt
 from .retry_loop import compile_with_llm
 from .retry_loop import CompileSource
 from .retry_loop import RetryCompileResult
+from .revalidation import check_thresholds
+from .revalidation import EventTypeCounts
+from .revalidation import revalidate_compiled_extractors
+from .revalidation import RevalidationReport
+from .revalidation import RevalidationThresholds
+from .revalidation import ThresholdCheckResult
 from .runtime_fallback import FallbackOutcome
 from .runtime_fallback import run_with_fallback
 from .runtime_registry import build_runtime_extractor_registry
@@ -90,25 +105,36 @@ __all__ = [
     "AstFailure",
     "AstReport",
     "AttemptRecord",
+    "BUNDLE_MIRROR_TABLE_SCHEMA",
+    "BigQueryBundleStore",
+    "BundleRow",
+    "BundleStore",
     "CompileMeasurement",
     "CompileResult",
     "CompileSource",
     "DETERMINISTIC_FAKE_MODEL",
     "DiscoveryResult",
+    "EventTypeCounts",
     "FallbackOutcome",
     "LoadFailure",
     "LoadedBundle",
     "FieldMapping",
     "LLMClient",
     "Manifest",
+    "MirrorFailure",
     "OutcomeCallback",
     "PlanParseError",
     "PlanResolver",
+    "PublishResult",
     "RESOLVED_EXTRACTOR_PLAN_JSON_SCHEMA",
     "ResolvedExtractorPlan",
     "RetryCompileResult",
+    "RevalidationReport",
+    "RevalidationThresholds",
     "SmokeTestReport",
     "SpanHandlingRule",
+    "SyncResult",
+    "ThresholdCheckResult",
     "WrappedRegistry",
     "build_ast_diagnostic",
     "build_compile_result_diagnostic",
@@ -118,6 +144,7 @@ __all__ = [
     "build_retry_prompt",
     "build_runtime_extractor_registry",
     "build_smoke_diagnostic",
+    "check_thresholds",
     "compile_extractor",
     "compile_with_llm",
     "compute_fingerprint",
@@ -128,7 +155,10 @@ __all__ = [
     "load_callable_from_source",
     "now_iso_utc",
     "parse_resolved_extractor_plan_json",
+    "publish_bundles_to_bq",
     "render_extractor_source",
+    "revalidate_compiled_extractors",
+    "sync_bundles_from_bq",
     "run_smoke_test",
     "run_smoke_test_in_subprocess",
     "run_with_fallback",
