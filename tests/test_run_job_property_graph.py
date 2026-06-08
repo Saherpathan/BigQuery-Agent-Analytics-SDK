@@ -93,6 +93,69 @@ _BASE_ENV = {
 }
 
 
+def _load_run_job():
+  spec = importlib.util.spec_from_file_location("_run_job_split", _RUN_JOB)
+  run_job = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(run_job)
+  return run_job
+
+
+def test_split_sql_statements_handles_semicolon_in_comments() -> None:
+  # Regression: the codelab table_ddl.sql comment "fills automatically; they
+  # are required" has a ';' inside a comment. A naive split(';') turns that
+  # into a comment-only fragment BigQuery rejects ("Unexpected end of
+  # statement"). The splitter must strip comments first.
+  run_job = _load_run_job()
+  ddl = (
+      "-- ``session_id`` are SDK metadata columns the\n"
+      "-- materializer fills automatically; they are required on every\n"
+      "-- bound table.\n"
+      "--\n"
+      "-- Apply with:\n"
+      "--   envsubst < table_ddl.sql | bq query\n"
+      "CREATE TABLE IF NOT EXISTS `p.d.a` (id STRING);\n"
+      "CREATE TABLE IF NOT EXISTS `p.d.b` (id STRING);\n"
+  )
+  stmts = run_job._split_sql_statements(ddl)
+  assert len(stmts) == 2
+  assert all(s.startswith("CREATE TABLE IF NOT EXISTS") for s in stmts)
+  assert all(";" not in s for s in stmts)
+
+
+def test_split_sql_statements_is_quote_aware() -> None:
+  # Semicolons / -- inside string literals, OPTIONS descriptions, and
+  # backtick identifiers must NOT split the statement or be stripped.
+  run_job = _load_run_job()
+  ddl = (
+      "CREATE TABLE `p.d.a` (\n"
+      '  id STRING OPTIONS(description="has; a semicolon and -- dashes"),\n'
+      "  note STRING DEFAULT 'x;y'\n"
+      ");\n"
+      "CREATE TABLE `p.d.b` (id STRING);\n"
+  )
+  stmts = run_job._split_sql_statements(ddl)
+  assert len(stmts) == 2
+  # The in-string semicolons and dashes survive intact in the first statement.
+  assert 'description="has; a semicolon and -- dashes"' in stmts[0]
+  assert "DEFAULT 'x;y'" in stmts[0]
+  assert stmts[1] == "CREATE TABLE `p.d.b` (id STRING)"
+
+
+def test_split_sql_statements_handles_block_comments_and_escapes() -> None:
+  run_job = _load_run_job()
+  ddl = (
+      "CREATE TABLE `p.d.a` /* inline; comment */ (\n"
+      "  s STRING DEFAULT 'a\\';b'\n"  # escaped quote then ; inside the string
+      ");\n"
+      "CREATE TABLE `p.d.b` (id STRING)"
+  )
+  stmts = run_job._split_sql_statements(ddl)
+  assert len(stmts) == 2
+  assert "/* inline; comment */" not in stmts[0]  # block comment removed
+  assert "DEFAULT 'a\\';b'" in stmts[0]  # in-string ; preserved
+  assert stmts[1] == "CREATE TABLE `p.d.b` (id STRING)"
+
+
 def test_property_graph_mode(monkeypatch) -> None:
   rc, kwargs, retargets = _drive(
       monkeypatch, {**_BASE_ENV, "BQAA_PROPERTY_GRAPH": "property_graph.sql"}

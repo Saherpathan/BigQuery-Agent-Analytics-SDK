@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Schema-derived (`--property-graph`) materialization, local → production**
+  (local: [#277](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/277)
+  via [#278](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/278)–[#281](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/281),
+  [#285](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/285),
+  [#287](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/287);
+  deploy: [#286](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/286)
+  via [#288](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/288)–[#292](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/pull/292))
+  — `bqaa context-graph --property-graph property_graph.sql` derives the ontology
+  + binding from the property graph + live table schemas, so no hand-written
+  `ontology.yaml` / `binding.yaml` is needed for rename-free graphs. Scheduled
+  production reaches parity: the Cloud Run deploy script, image builder,
+  `run_job.py` (`BQAA_PROPERTY_GRAPH`), and the Terraform module all accept the
+  one-artifact flow (placeholdered `property_graph.sql` + sibling
+  `table_ddl.sql`), with a split read-only-events / writable-graph contract
+  (events read-only; graph tables + `_bqaa_materialization_state` land in the
+  graph dataset). Explicit `--ontology`/`--binding` is preserved as the advanced
+  override (descriptions, inheritance, derived properties, renames, the
+  migration-v5 compiled extractor).
+
+### Fixed
+
+- **`run_job.py` table-DDL bootstrap mis-split on statement boundaries**
+  ([#286](https://github.com/GoogleCloudPlatform/BigQuery-Agent-Analytics-SDK/issues/286))
+  — `_bootstrap_entity_tables` split the DDL on `;` without accounting for
+  comments or quoting, so a `;` inside a `--` comment (e.g. the codelab
+  `table_ddl.sql`'s "materializer fills automatically; they are required")
+  produced a comment-only fragment BigQuery rejected with "Unexpected end of
+  statement" — and a `;` or `--` inside a string literal
+  (`OPTIONS(description="has; semicolon")`, `DEFAULT 'a;b'`) or a backtick
+  identifier could corrupt a customer's DDL. Replaced with a quote- and
+  comment-aware splitter: it strips `--` line comments and `/* */` block
+  comments and splits on `;` only at the top level (never inside `'`, `"`, or
+  `` ` `` quoting). Found by a live `--property-graph` deploy smoke.
+
 ## [0.3.2] - 2026-05-22
 
 ### Release highlights
