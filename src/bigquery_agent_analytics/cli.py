@@ -1771,25 +1771,30 @@ def _validate_context_graph_input_mode(
     ontology_path: Optional[str],
     binding_path: Optional[str],
     property_graph_path: Optional[str],
+    graph: Optional[str] = None,
 ) -> None:
   """Enforce exactly one input mode for the graph-refresh command.
 
-  Exactly one of (``--ontology`` + ``--binding``) or ``--property-graph`` must
-  be supplied. Raises ``typer.BadParameter`` (rendered as a usage error)
-  otherwise. Kept as a pure helper so the rule is unit-tested directly rather
-  than through brittle assertions on rendered CLI output.
+  Exactly one of ``--graph``, ``--property-graph``, or (``--ontology`` +
+  ``--binding``) must be supplied. Raises ``typer.BadParameter`` (rendered as
+  a usage error) otherwise. Kept as a pure helper so the rule is unit-tested
+  directly rather than through brittle assertions on rendered CLI output.
   """
   has_separated = ontology_path is not None or binding_path is not None
-  if property_graph_path is not None and has_separated:
+  modes_supplied = sum(
+      [graph is not None, property_graph_path is not None, has_separated]
+  )
+  if modes_supplied > 1:
     raise typer.BadParameter(
-        "Use either --property-graph or --ontology/--binding, not both."
+        "Use exactly one of --graph, --property-graph, or"
+        " --ontology/--binding."
     )
-  if property_graph_path is None and (
-      ontology_path is None or binding_path is None
+  if modes_supplied == 0 or (
+      has_separated and (ontology_path is None or binding_path is None)
   ):
     raise typer.BadParameter(
-        "Provide --property-graph PATH, or both --ontology PATH and"
-        " --binding PATH."
+        "Provide --graph NAME, --property-graph PATH, or both --ontology PATH"
+        " and --binding PATH."
     )
 
 
@@ -1806,7 +1811,8 @@ def materialize_window(
         "--ontology",
         help=(
             "Path to ontology YAML file. Use with --binding, or omit both and"
-            " pass --property-graph to derive them from the graph DDL."
+            " pass --graph to derive them from the property graph you already"
+            " deployed to BigQuery."
         ),
     ),
     binding_path: Optional[str] = typer.Option(
@@ -1822,6 +1828,19 @@ def materialize_window(
             " and binding from the graph definition + table schemas, so no"
             " hand-written ontology.yaml/binding.yaml is needed. Mutually"
             " exclusive with --ontology/--binding."
+        ),
+    ),
+    graph: Optional[str] = typer.Option(
+        None,
+        "--graph",
+        help=(
+            "Name of a property graph already deployed to BigQuery (bare"
+            " name, dataset.graph, or project.dataset.graph; bare names"
+            " resolve in --dataset-id). Reads the graph's DDL back from"
+            " INFORMATION_SCHEMA.PROPERTY_GRAPHS and derives the ontology and"
+            " binding from it + the live table schemas — the deployed graph"
+            " is the single source of truth. Mutually exclusive with"
+            " --property-graph and --ontology/--binding."
         ),
     ),
     events_table: str = typer.Option(
@@ -1996,6 +2015,18 @@ def materialize_window(
             "mode."
         ),
     ),
+    endpoint: str = typer.Option(
+        "gemini-2.5-flash",
+        "--endpoint",
+        help=(
+            "Vertex AI model for the AI.GENERATE extraction "
+            "fallback (used in 'ai-fallback' mode). Short names "
+            "resolve to a locations/global publisher URL, so "
+            "Gemini 3.x models such as 'gemini-3.5-flash' work "
+            "here. Ignored under --extraction-mode=compiled-only "
+            "(no AI call is made)."
+        ),
+    ),
     fmt: str = typer.Option(
         "json",
         "--format",
@@ -2021,9 +2052,9 @@ def materialize_window(
           programming bug).
   """
   # Validate the input mode before any work: exactly one of
-  # (--ontology + --binding) or (--property-graph).
+  # --graph, --property-graph, or (--ontology + --binding).
   _validate_context_graph_input_mode(
-      ontology_path, binding_path, property_graph_path
+      ontology_path, binding_path, property_graph_path, graph
   )
 
   try:
@@ -2044,6 +2075,7 @@ def materialize_window(
         ontology_path=ontology_path,
         binding_path=binding_path,
         property_graph_path=property_graph_path,
+        graph=graph,
         events_table=events_table,
         lookback_hours=lookback_hours,
         overlap_minutes=overlap_minutes,
@@ -2063,6 +2095,7 @@ def materialize_window(
         extraction_mode=extraction_mode,
         state_key_suffix=state_key_suffix,
         max_session_age_hours=max_session_age_hours,
+        endpoint=endpoint,
     )
     typer.echo(format_output(result.to_json(), fmt))
     if not result.ok:
