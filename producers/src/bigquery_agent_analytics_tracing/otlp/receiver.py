@@ -15,10 +15,11 @@
 """OTLP receiver request handling (issue #316, PR 3).
 
 The transport-agnostic core: authenticate, decode an OTLP export body, run it
-through the PR-2 decode library, and route the resulting envelopes to the main
-Pub/Sub topic (success) or the DLQ topic (dead letters). The HTTP/WSGI
-entrypoint (``app.py``) and the real Pub/Sub publisher wrap this; tests drive it
-directly with local fixtures and a fake publisher — no network needed.
+through the PR-2 decode library, and publish the resulting envelopes to the main
+ingest topic — success rows and dead letters alike (dead letters carry
+``delivery.dlq=true``; the consumer routes those to ``otlp_dead_letter``). The
+HTTP/WSGI entrypoint (``app.py``) and the real Pub/Sub publisher wrap this;
+tests drive it directly with local fixtures and a fake publisher — no network.
 
 The original request bytes (``body``) are threaded into the decode layer so
 dead-letter envelopes carry a replayable payload and a reproducible request
@@ -61,7 +62,6 @@ class DecodeError(Exception):
 class ReceiverConfig:
   expected_token: str
   main_topic: str
-  dlq_topic: str
   enable_traces: bool = False  # signal-tier gate (#324)
   source_product: str = "claude_code"
 
@@ -133,14 +133,19 @@ def route_envelopes(
     publisher: Publisher,
     config: ReceiverConfig,
 ) -> tuple[int, int]:
-  """Publish each envelope to the main topic, or the DLQ if it is a dead letter."""
+  """Publish every envelope to the **main** ingest topic.
+
+  Dead letters travel the same path with ``delivery.dlq=true``; the consumer
+  routes those to ``otlp_dead_letter`` — so parse/decode errors actually reach
+  the table. (The subscription's Pub/Sub dead-letter policy is a separate
+  transport safety net for consumer-side poison messages, not this path.)
+  """
   published = dead = 0
   for envelope in envelopes:
+    publisher.publish(config.main_topic, _encode(envelope))
     if envelope.get("delivery", {}).get("dlq"):
-      publisher.publish(config.dlq_topic, _encode(envelope))
       dead += 1
     else:
-      publisher.publish(config.main_topic, _encode(envelope))
       published += 1
   return published, dead
 
@@ -203,7 +208,9 @@ def handle_export(
         received_at=ingest_time,
         raw_otlp_request_hash=env.request_hash(body),
     )
-    publisher.publish(config.dlq_topic, _encode(dead_letter))
+    # Same main topic as success rows; the consumer routes delivery.dlq=true to
+    # otlp_dead_letter.
+    publisher.publish(config.main_topic, _encode(dead_letter))
     return ReceiverResult(
         400, dead_lettered=1, message="malformed otlp request"
     )
