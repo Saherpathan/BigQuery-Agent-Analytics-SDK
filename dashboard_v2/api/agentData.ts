@@ -1,5 +1,23 @@
+/*
+ * Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 import { BigQuery } from '@google-cloud/bigquery';
+import { randomUUID } from 'crypto';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 const TIME_SPANS: Record<string, string> = {
@@ -14,6 +32,15 @@ const TIME_SPANS: Record<string, string> = {
 const PROJECT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9-]{0,61}[A-Za-z0-9]$/;
 const BQ_ID_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,1023}$/;
 const DEFAULT_SERVICE_ACCOUNT_PATH = path.resolve(process.cwd(), 'service-account.json');
+const APPLICATION_DEFAULT_CREDENTIALS_PATH = path.join(
+  os.homedir(),
+  '.config',
+  'gcloud',
+  'application_default_credentials.json'
+);
+const DASHBOARD_PROJECT_ID = process.env.DASHBOARD_BQ_PROJECT_ID?.trim();
+const DASHBOARD_DATASET_ID = process.env.DASHBOARD_BQ_DATASET_ID?.trim();
+const DASHBOARD_TABLE_ID = process.env.DASHBOARD_BQ_TABLE_ID?.trim();
 
 export type AgentDataRequest = {
   method?: string;
@@ -93,16 +120,85 @@ function loadServiceAccountCredentials(): {
   return null;
 }
 
+function hasApplicationDefaultCredentials(): boolean {
+  return fs.existsSync(APPLICATION_DEFAULT_CREDENTIALS_PATH);
+}
+
+function isProductionDeployment(): boolean {
+  return Boolean(process.env.VERCEL) || process.env.NODE_ENV === 'production';
+}
+
+function getConfiguredDashboardTableRef(): { projectId: string; datasetId: string; tableId: string } | null {
+  if (!DASHBOARD_PROJECT_ID || !DASHBOARD_DATASET_ID || !DASHBOARD_TABLE_ID) {
+    return null;
+  }
+
+  return {
+    projectId: DASHBOARD_PROJECT_ID,
+    datasetId: DASHBOARD_DATASET_ID,
+    tableId: DASHBOARD_TABLE_ID,
+  };
+}
+
+function resolveDashboardTableRef(req: AgentDataRequest):
+  | { projectId: string; datasetId: string; tableId: string }
+  | { status: number; error: string } {
+  const configuredTableRef = getConfiguredDashboardTableRef();
+
+  if (configuredTableRef) {
+    const userProject = getHeader(req, 'x-gcp-project-id');
+    const userDataset = getHeader(req, 'x-bq-dataset');
+    const userTable = getHeader(req, 'x-bq-table');
+
+    if (
+      userProject !== configuredTableRef.projectId
+      || userDataset !== configuredTableRef.datasetId
+      || userTable !== configuredTableRef.tableId
+    ) {
+      return {
+        status: 403,
+        error: 'Dashboard table is not authorized for this deployment.',
+      };
+    }
+
+    return configuredTableRef;
+  }
+
+  if (isProductionDeployment()) {
+    return {
+      status: 500,
+      error: 'Dashboard table configuration is missing. Set DASHBOARD_BQ_PROJECT_ID, DASHBOARD_BQ_DATASET_ID, and DASHBOARD_BQ_TABLE_ID.',
+    };
+  }
+
+  const userProject = getHeader(req, 'x-gcp-project-id');
+  const userDataset = getHeader(req, 'x-bq-dataset');
+  const userTable = getHeader(req, 'x-bq-table');
+
+  if (!userProject || !userDataset || !userTable) {
+    return {
+      status: 400,
+      error: 'Missing Configuration: Ensure Project, Dataset, and Table IDs are entered.',
+    };
+  }
+
+  return {
+    projectId: userProject,
+    datasetId: userDataset,
+    tableId: userTable,
+  };
+}
+
 function hasBigQueryAuthConfigured(): boolean {
   if (process.env.GCP_CLIENT_EMAIL && process.env.GCP_PRIVATE_KEY) {
     return true;
   }
 
-  return Boolean(loadServiceAccountCredentials());
+  return Boolean(loadServiceAccountCredentials()) || hasApplicationDefaultCredentials();
 }
 
 export function getDashboardRuntimeStatus() {
-  const ready = hasBigQueryAuthConfigured();
+  const ready = hasBigQueryAuthConfigured() && (!isProductionDeployment() || Boolean(getConfiguredDashboardTableRef()));
   if (ready) {
     return { ready, missing: [] };
   }
@@ -121,8 +217,14 @@ export function getDashboardRuntimeStatus() {
     if (!fs.existsSync(gacPath)) {
       missing.push('GOOGLE_APPLICATION_CREDENTIALS (file not found)');
     }
-  } else if (!fs.existsSync(DEFAULT_SERVICE_ACCOUNT_PATH)) {
+  } else if (!fs.existsSync(DEFAULT_SERVICE_ACCOUNT_PATH) && !hasApplicationDefaultCredentials()) {
     missing.push('GOOGLE_APPLICATION_CREDENTIALS or service-account.json');
+  }
+
+  if (isProductionDeployment() && !getConfiguredDashboardTableRef()) {
+    missing.push('DASHBOARD_BQ_PROJECT_ID');
+    missing.push('DASHBOARD_BQ_DATASET_ID');
+    missing.push('DASHBOARD_BQ_TABLE_ID');
   }
 
   return { ready: false, missing };
@@ -155,9 +257,7 @@ function getBigQueryClient(): BigQuery {
     });
   }
 
-  throw new Error(
-    'BigQuery authentication is not configured. Set GOOGLE_APPLICATION_CREDENTIALS to a service account JSON file or provide GCP_CLIENT_EMAIL and GCP_PRIVATE_KEY.'
-  );
+  return new BigQuery({ projectId });
 }
 
 function assertValidTableRef(projectId: string, datasetId: string, tableId: string) {
@@ -289,31 +389,18 @@ export async function handleAgentDataRequest(req: AgentDataRequest): Promise<Age
     };
   }
 
-  const userProject = getHeader(req, 'x-gcp-project-id');
-  const userDataset = getHeader(req, 'x-bq-dataset');
-  const userTable = getHeader(req, 'x-bq-table');
   const timespan = firstQueryValue(req.query?.timespan);
 
-  if (!userProject || !userDataset || !userTable) {
+  const tableRef = resolveDashboardTableRef(req);
+  if ('status' in tableRef) {
     return {
-      status: 400,
-      body: {
-        error: 'Missing Configuration: Ensure Project, Dataset, and Table IDs are entered.',
-      },
-    };
-  }
-
-  if (!hasBigQueryAuthConfigured()) {
-    return {
-      status: 500,
-      body: {
-        error: 'BigQuery authentication is not configured for this dashboard. Set GOOGLE_APPLICATION_CREDENTIALS to a service account JSON file or provide GCP_CLIENT_EMAIL and GCP_PRIVATE_KEY.',
-      },
+      status: tableRef.status,
+      body: { error: tableRef.error },
     };
   }
 
   try {
-    assertValidTableRef(userProject, userDataset, userTable);
+    assertValidTableRef(tableRef.projectId, tableRef.datasetId, tableRef.tableId);
   } catch (error: any) {
     return {
       status: 400,
@@ -322,7 +409,7 @@ export async function handleAgentDataRequest(req: AgentDataRequest): Promise<Age
   }
 
   const interval = TIME_SPANS[String(timespan || '24h')] || TIME_SPANS['24h'];
-  const tablePath = `\`${userProject}.${userDataset}.${userTable}\``;
+  const tablePath = `\`${tableRef.projectId}.${tableRef.datasetId}.${tableRef.tableId}\``;
   const query = `
     SELECT * FROM ${tablePath}
     WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL ${interval})
@@ -337,12 +424,13 @@ export async function handleAgentDataRequest(req: AgentDataRequest): Promise<Age
       body: applyDashboardFilters(rows.map(normalizeRow), req),
     };
   } catch (error: any) {
-    console.error('BigQuery connector error:', error);
+    const requestId = randomUUID();
+    console.error('BigQuery connector error', { requestId, error });
     return {
       status: 500,
       body: {
-        error: error.message || 'Failed to query BigQuery',
-        code: error.code,
+        error: 'Failed to query BigQuery. Include the request ID when reporting this error.',
+        requestId,
       },
     };
   }

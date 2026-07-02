@@ -1,3 +1,19 @@
+/*
+ * Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 import React, { useEffect, useState } from 'react';
 import { 
   Filter, 
@@ -5,7 +21,6 @@ import {
   Calendar, 
   Cpu, 
   Check, 
-  Key, 
   Database, 
   Table as TableIcon, 
   LayoutGrid,
@@ -19,14 +34,11 @@ import { cn } from '../lib/utils';
 export const CommandBar: React.FC = () => {
   const { filters, setFilters } = useDashboardFilters();
   const [copied, setCopied] = useState(false);
-
-  // --- User Credentials State ---
-  const [apiKey, setApiKey] = useState(localStorage.getItem('user_gemini_key') || '');
   const [projectId, setProjectId] = useState(filters.projectId || localStorage.getItem('user_gcp_project') || '');
   const [datasetId, setDatasetId] = useState(filters.datasetId || localStorage.getItem('user_bq_dataset') || '');
   const [tableId, setTableId] = useState(filters.tableId || localStorage.getItem('user_bq_table') || '');
 
-  React.useEffect(() => {
+  useEffect(() => {
     setProjectId(filters.projectId || '');
     setDatasetId(filters.datasetId || '');
     setTableId(filters.tableId || '');
@@ -100,21 +112,6 @@ export const CommandBar: React.FC = () => {
         {/* Right: Customer-owned Billing Inputs */}
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2 px-4 border-l border-zinc-800">
-            
-            {/* GEMINI API KEY */}
-            <div className="relative group" title="Gemini API Key">
-              <Key className="absolute left-2 top-1/2 -translate-y-1/2 text-zinc-600 group-focus-within:text-emerald-500 transition-colors" size={10} />
-              <input 
-                type="password" 
-                placeholder="Gemini Key" 
-                value={apiKey}
-                onChange={(e) => {
-                  setApiKey(e.target.value);
-                  localStorage.setItem('user_gemini_key', e.target.value);
-                }}
-                className="h-8 w-28 bg-zinc-900/50 border border-zinc-800 rounded pl-7 pr-2 text-[10px] text-emerald-500 focus:border-emerald-500/50 outline-none transition-all placeholder:text-zinc-700"
-              />
-            </div>
 
             {/* GCP PROJECT ID */}
             <div className="relative group" title="Customer-owned GCP Project ID">
