@@ -158,3 +158,123 @@ def test_console_script_is_registered():
   assert (
       scripts["bqaa-otel"] == "bigquery_agent_analytics_tracing.otlp.cli:main"
   )
+
+
+# --------------------------------------------------------------------------
+# bootstrap subcommand (PR2)
+# --------------------------------------------------------------------------
+
+
+def test_bootstrap_default_is_plan_mode(tmp_path, capsys, monkeypatch):
+  from bigquery_agent_analytics_tracing.otlp import bootstrap
+
+  def _boom(*a, **k):
+    raise AssertionError("plan mode must not execute")
+
+  monkeypatch.setattr(bootstrap.SubprocessRunner, "run", _boom)
+  rc = _run(
+      [
+          "bootstrap",
+          "--project",
+          "my-proj",
+          "--out",
+          str(tmp_path),
+      ]
+  )
+  assert rc == 0
+  out = capsys.readouterr().out
+  assert "--execute" in out
+  assert "gcloud run deploy bqaa-otlp-receiver" in out
+
+
+def test_bootstrap_execute_invokes_run_bootstrap(tmp_path, monkeypatch):
+  import pathlib as _pathlib
+
+  from bigquery_agent_analytics_tracing.otlp import bootstrap
+
+  # --execute refuses to run outside the repo root (Cloud Build context).
+  monkeypatch.chdir(_pathlib.Path(bootstrap.__file__).parents[4])
+  seen = {}
+
+  def _fake_run_bootstrap(settings, runner, **kw):
+    seen["settings"] = settings
+    seen["runner"] = runner
+    return bootstrap.BootstrapResult("https://r", "https://c", ())
+
+  monkeypatch.setattr(bootstrap, "run_bootstrap", _fake_run_bootstrap)
+  rc = _run(
+      [
+          "bootstrap",
+          "--project",
+          "my-proj",
+          "--dataset",
+          "ds1",
+          "--signals",
+          "logs,metrics,traces",
+          "--out",
+          str(tmp_path),
+          "--execute",
+      ]
+  )
+  assert rc == 0
+  assert seen["settings"].project == "my-proj"
+  assert seen["settings"].dataset == "ds1"
+  assert seen["settings"].enable_spans is True
+  assert isinstance(seen["runner"], bootstrap.SubprocessRunner)
+
+
+def test_bootstrap_replay_requires_ack_flag(capsys):
+  rc = _run(
+      [
+          "bootstrap",
+          "--project",
+          "my-proj",
+          "--privacy",
+          "replay",
+      ]
+  )
+  assert rc != 0
+  assert "--i-understand-content-logging" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# bootstrap failure modes (#331 full review)
+# --------------------------------------------------------------------------
+
+
+def test_bootstrap_execute_surfaces_failed_step_stderr(monkeypatch, capsys):
+  import subprocess
+
+  from bigquery_agent_analytics_tracing.otlp import bootstrap
+
+  def _boom(*a, **k):
+    raise subprocess.CalledProcessError(
+        1, ["gcloud", "run", "deploy"], stderr="PERMISSION_DENIED: nope"
+    )
+
+  monkeypatch.setattr(bootstrap, "run_bootstrap", _boom)
+  monkeypatch.setattr("pathlib.Path.is_file", lambda self: True)
+  rc = _run(["bootstrap", "--project", "p", "--execute"])
+  assert rc == 1
+  err = capsys.readouterr().err
+  assert "gcloud run deploy" in err
+  assert "PERMISSION_DENIED: nope" in err
+
+
+def test_bootstrap_execute_requires_repo_root(monkeypatch, tmp_path, capsys):
+  from bigquery_agent_analytics_tracing.otlp import bootstrap
+
+  def _never(*a, **k):
+    raise AssertionError("must not deploy without the Dockerfile present")
+
+  monkeypatch.setattr(bootstrap, "run_bootstrap", _never)
+  monkeypatch.chdir(tmp_path)  # no deploy/otlp_receiver/Dockerfile here
+  rc = _run(["bootstrap", "--project", "p", "--execute"])
+  assert rc == 2
+  assert "repository root" in capsys.readouterr().err
+
+
+def test_bootstrap_rejects_bogus_source(capsys):
+  rc = _run(["bootstrap", "--project", "p", "--source", "cursor"])
+  assert rc == 2
+  assert "source" in capsys.readouterr().err
