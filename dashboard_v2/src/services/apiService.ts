@@ -35,6 +35,9 @@ const HEALTH_CACHE_KEY = 'dashboard-health';
 export type DashboardHealth = {
   ready: boolean;
   missing?: string[];
+  // Set when the deployment pins its table via DASHBOARD_BQ_* env vars; the
+  // UI uses it to pre-fill the source fields.
+  source?: BigQuerySource;
 };
 
 export function isBigQueryAuthError(error: unknown): boolean {

@@ -49,7 +49,7 @@ export function useDashboardFilters() {
    */
   const setFilters = useCallback((newFilters: Partial<DashboardFilters>) => {
     const params = new URLSearchParams(searchParams);
-    
+
     // Helper to handle parameter updates
     const updateParam = (key: string, value: string | undefined) => {
       if (!value || value === 'all') {
@@ -69,12 +69,12 @@ export function useDashboardFilters() {
     if (newFilters.projectId !== undefined) updateParam('project_id', newFilters.projectId);
     if (newFilters.datasetId !== undefined) updateParam('dataset_id', newFilters.datasetId);
     if (newFilters.tableId !== undefined) updateParam('table_id', newFilters.tableId);
-    
+
     if (newFilters.traceId !== undefined) {
       if (newFilters.traceId) params.set('trace_id', newFilters.traceId);
       else params.delete('trace_id');
     }
-    
+
     setSearchParams(params, { replace: true });
   }, [searchParams, setSearchParams]);
 

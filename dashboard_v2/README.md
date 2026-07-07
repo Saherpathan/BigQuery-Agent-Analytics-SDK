@@ -75,6 +75,24 @@ GOOGLE_APPLICATION_CREDENTIALS=./service-account.json
 For a ready-to-edit template, see `dashboard_v2/.env.example`. For step-by-step
 local setup and troubleshooting, see `LOCAL_SETUP.md` at the repository root.
 
+## Production / hosted deployments
+
+Deployed instances (Vercel, or anything with `NODE_ENV=production`) must pin
+the one table the dashboard is allowed to read. The API refuses to serve any
+other table, so the server credential can never be used as a proxy to read
+arbitrary tables it has access to:
+
+```env
+DASHBOARD_BQ_PROJECT_ID=your-project-id
+DASHBOARD_BQ_DATASET_ID=your_dataset
+DASHBOARD_BQ_TABLE_ID=agent_events
+```
+
+If these are unset in production, `/api` returns a configuration error. The
+`/api/health` endpoint reports the pinned table so the UI can pre-fill the
+source fields automatically.
+
+## Local development
 
 The Project / Dataset / Table fields in the dashboard identify the
 customer-owned table to read. The service account must belong to that
@@ -219,6 +237,3 @@ GCP_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
 ```
 
 ---
-
-
-

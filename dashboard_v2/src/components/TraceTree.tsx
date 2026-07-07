@@ -34,7 +34,7 @@ function CustomNode({ data }: any) {
       isError ? "border-red-500/50 shadow-[0_0_20px_rgba(239,68,68,0.1)]" : "border-zinc-800 hover:border-zinc-700"
     )}>
       <Handle type="target" position={Position.Top} className="!bg-zinc-700 !w-2 !h-2" />
-      
+
       <div className="flex items-center justify-between gap-3">
         <div className={cn(
           "flex h-9 w-9 items-center justify-center rounded-md border",
@@ -46,7 +46,7 @@ function CustomNode({ data }: any) {
           {node.type === 'agent' && <Bot size={18} />}
           {node.type === 'tool' && <Wrench size={18} />}
         </div>
-        
+
         <div className="flex-1 overflow-hidden">
           <p className="text-[9px] font-black uppercase tracking-tighter opacity-40 mb-0.5">{node.type || 'node'}</p>
           <p className="text-xs font-bold truncate text-zinc-200">{node.label || node.agent || 'Unknown Task'}</p>
@@ -94,7 +94,7 @@ export const TraceTree: React.FC = () => {
         target: node.id || node.trace_id,
         animated: true,
         type: 'smoothstep',
-        style: { 
+        style: {
           stroke: node.status === 'error' ? '#ef4444' : '#3f3f46',
           strokeWidth: 2,
         },
@@ -178,14 +178,14 @@ export const TraceTree: React.FC = () => {
             Reasoning Trace Execution
           </h3>
         </div>
-        
+
         <div className="flex items-center gap-5 p-2 bg-zinc-900/50 rounded-lg border border-zinc-800">
           <LegendItem color="bg-amber-500" label="Orchestrator" />
           <LegendItem color="bg-blue-500" label="Agent" />
           <LegendItem color="bg-emerald-500" label="Tool" />
         </div>
       </div>
-      
+
       <div className="h-[500px] w-full overflow-hidden rounded-lg bg-zinc-950/20 border border-zinc-800/50 shadow-inner">
         <ReactFlow
           nodes={nodes}

@@ -15,14 +15,14 @@
  */
 
 import React, { useEffect, useState } from 'react';
-import { 
-  Filter, 
-  Share2, 
-  Calendar, 
-  Cpu, 
-  Check, 
-  Database, 
-  Table as TableIcon, 
+import {
+  Filter,
+  Share2,
+  Calendar,
+  Cpu,
+  Check,
+  Database,
+  Table as TableIcon,
   LayoutGrid,
   User,
   Fingerprint,
@@ -54,7 +54,7 @@ export const CommandBar: React.FC = () => {
   return (
     <div className="sticky top-0 z-50 w-full border-b border-zinc-800 bg-black/80 backdrop-blur-md">
       <div className="mx-auto flex h-14 max-w-[1600px] items-center justify-between px-6">
-        
+
         {/* Left: Branding & Logic Filters */}
         <div className="flex items-center gap-8">
           <div className="flex items-center gap-3">
@@ -67,10 +67,10 @@ export const CommandBar: React.FC = () => {
           </div>
 
           <div className="flex items-center gap-6">
-            <FilterSelect 
-              icon={<Cpu size={14} />} 
-              label="Agent" 
-              value={filters.agentId || 'all'} 
+            <FilterSelect
+              icon={<Cpu size={14} />}
+              label="Agent"
+              value={filters.agentId || 'all'}
               options={['all', 'orchestrator', 'billing_agent', 'swot_analyzer', 'research_bot']}
               onChange={(v) => setFilters({ agentId: v })}
             />
@@ -98,11 +98,11 @@ export const CommandBar: React.FC = () => {
               placeholder="span-id"
               onChange={(value) => setFilters({ spanId: value })}
             />
-            
-            <FilterSelect 
-              icon={<Calendar size={14} />} 
-              label="Timespan" 
-              value={filters.timespan || '24h'} 
+
+            <FilterSelect
+              icon={<Calendar size={14} />}
+              label="Timespan"
+              value={filters.timespan || '24h'}
               options={['1h', '24h', '7d', '30d', '90d', '1y']}
               onChange={(v) => setFilters({ timespan: v })}
             />
@@ -116,9 +116,9 @@ export const CommandBar: React.FC = () => {
             {/* GCP PROJECT ID */}
             <div className="relative group" title="Customer-owned GCP Project ID">
               <LayoutGrid className="absolute left-2 top-1/2 -translate-y-1/2 text-zinc-600 group-focus-within:text-blue-400 transition-colors" size={10} />
-              <input 
-                type="text" 
-                placeholder="Your Project" 
+              <input
+                type="text"
+                placeholder="Your Project"
                 value={projectId}
                 onChange={(e) => {
                   setProjectId(e.target.value);
@@ -132,9 +132,9 @@ export const CommandBar: React.FC = () => {
             {/* BIGQUERY DATASET */}
             <div className="relative group" title="Customer-owned BigQuery Dataset ID">
               <Database className="absolute left-2 top-1/2 -translate-y-1/2 text-zinc-600 group-focus-within:text-zinc-300 transition-colors" size={10} />
-              <input 
-                type="text" 
-                placeholder="Your Dataset" 
+              <input
+                type="text"
+                placeholder="Your Dataset"
                 value={datasetId}
                 onChange={(e) => {
                   setDatasetId(e.target.value);
@@ -148,9 +148,9 @@ export const CommandBar: React.FC = () => {
             {/* BIGQUERY TABLE */}
             <div className="relative group" title="Customer-owned BigQuery Table ID">
               <TableIcon className="absolute left-2 top-1/2 -translate-y-1/2 text-zinc-600 group-focus-within:text-zinc-300 transition-colors" size={10} />
-              <input 
-                type="text" 
-                placeholder="Your Table" 
+              <input
+                type="text"
+                placeholder="Your Table"
                 value={tableId}
                 onChange={(e) => {
                   setTableId(e.target.value);
@@ -166,7 +166,7 @@ export const CommandBar: React.FC = () => {
             <span className="text-zinc-700">Future:</span> custom labels
           </div>
 
-          <button 
+          <button
             onClick={handleShare}
             className={cn(
               "flex h-8 items-center gap-2 rounded-md border border-zinc-800 bg-brand-card px-3 text-[11px] font-bold uppercase tracking-tight transition-all",
@@ -198,7 +198,7 @@ const FilterSelect: React.FC<FilterSelectProps> = ({ icon, label, value, options
       {label}
     </div>
     <div className="relative">
-      <select 
+      <select
         value={value}
         onChange={(e) => onChange(e.target.value)}
         className="h-7 min-w-[80px] cursor-pointer appearance-none rounded border border-zinc-800 bg-zinc-900/20 px-2 pr-6 text-[11px] font-mono font-medium text-zinc-300 outline-none hover:border-zinc-700 hover:bg-zinc-800/50 transition-all uppercase"

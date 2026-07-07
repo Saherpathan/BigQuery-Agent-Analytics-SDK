@@ -198,9 +198,12 @@ function hasBigQueryAuthConfigured(): boolean {
 }
 
 export function getDashboardRuntimeStatus() {
-  const ready = hasBigQueryAuthConfigured() && (!isProductionDeployment() || Boolean(getConfiguredDashboardTableRef()));
+  // The pinned table ref is not a secret: it is the table this deployment
+  // exists to display. Reporting it lets the UI pre-fill the source fields.
+  const source = getConfiguredDashboardTableRef() || undefined;
+  const ready = hasBigQueryAuthConfigured() && (!isProductionDeployment() || Boolean(source));
   if (ready) {
-    return { ready, missing: [] };
+    return { ready, missing: [], source };
   }
 
   const missing: string[] = [];
@@ -227,7 +230,7 @@ export function getDashboardRuntimeStatus() {
     missing.push('DASHBOARD_BQ_TABLE_ID');
   }
 
-  return { ready: false, missing };
+  return { ready: false, missing, source };
 }
 
 function getBigQueryClient(): BigQuery {

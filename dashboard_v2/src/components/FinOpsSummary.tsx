@@ -51,14 +51,14 @@ export const FinOpsSummary: React.FC = () => {
       try {
         // Fetch raw rows from BigQuery based on selected timespan
         const rawData = await fetchAgentData(filters.timespan, filters);
-        
+
         /** * DATA TRANSFORMER
          * Since BigQuery returns raw rows, we calculate the summary metrics here.
          * Adjust these keys (total_tokens, cost, etc) based on your BQ column names.
          */
         const totalTokens = rawData.reduce((acc: number, curr: any) => acc + (Number(curr.total_tokens) || 0), 0);
         const totalSessions = new Set(rawData.map((r: any) => r.session_id)).size;
-        
+
         setStats({
           totalSessions: totalSessions || 0,
           sessionTrend: "+12%", // Mock trend for UI
@@ -175,7 +175,7 @@ export const FinOpsSummary: React.FC = () => {
             <p className="text-[11px] text-zinc-500 mt-1 font-medium italic">Projected usage based on historical BigQuery logs</p>
           </div>
         </div>
-        
+
         <div className="h-[320px] w-full">
           <ResponsiveContainer width="100%" height="100%">
             <AreaChart data={consumptionData}>

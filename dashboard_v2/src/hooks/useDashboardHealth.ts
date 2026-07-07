@@ -52,6 +52,7 @@ export function useDashboardHealth() {
   return {
     ready: Boolean(health?.ready),
     missing: health?.missing || [],
+    source: health?.source,
     loading,
     error,
   };

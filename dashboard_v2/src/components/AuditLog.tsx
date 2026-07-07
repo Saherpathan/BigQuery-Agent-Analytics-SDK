@@ -47,7 +47,7 @@ export const AuditLog: React.FC = () => {
       try {
         // Fetch raw rows for the selected timespan
         const rawData = await fetchAgentData(filters.timespan, filters);
-        
+
         /**
          * AGGREGATION LOGIC
          * We group raw BigQuery rows by session_id to show a high-level audit.
@@ -70,7 +70,7 @@ export const AuditLog: React.FC = () => {
           return acc;
         }, {});
 
-        setSessions(Object.values(grouped)); 
+        setSessions(Object.values(grouped));
       } catch (error) {
         if (!isBigQueryAuthError(error)) {
           console.error("Failed to fetch sessions:", error);
@@ -131,7 +131,7 @@ export const AuditLog: React.FC = () => {
             ACTIVE_SESSIONS: {sessions.length}
           </span>
         </div>
-        
+
         <div className="overflow-x-auto">
           <table className="w-full text-left border-collapse">
             <thead>

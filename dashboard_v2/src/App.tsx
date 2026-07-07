@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+import { useEffect } from 'react';
 import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { CommandBar } from './components/CommandBar';
@@ -27,8 +28,27 @@ import { useDashboardHealth } from './hooks/useDashboardHealth';
 const queryClient = new QueryClient();
 
 function Dashboard() {
-  const { filters } = useDashboardFilters();
-  const { ready: authReady, loading: healthLoading, missing: missingAuth } = useDashboardHealth();
+  const { filters, setFilters } = useDashboardFilters();
+  const {
+    ready: authReady,
+    loading: healthLoading,
+    missing: missingAuth,
+    source: pinnedSource,
+  } = useDashboardHealth();
+
+  // When the deployment pins its table via DASHBOARD_BQ_* env vars, the API
+  // only serves that table — adopt it so the source fields are pre-filled and
+  // stale localStorage/URL values can't produce 403s.
+  useEffect(() => {
+    if (!pinnedSource) return;
+    if (
+      filters.projectId !== pinnedSource.projectId
+      || filters.datasetId !== pinnedSource.datasetId
+      || filters.tableId !== pinnedSource.tableId
+    ) {
+      setFilters(pinnedSource);
+    }
+  }, [pinnedSource, filters.projectId, filters.datasetId, filters.tableId, setFilters]);
   const sourceLabel = filters.projectId && filters.datasetId && filters.tableId
     ? `${filters.projectId}.${filters.datasetId}.${filters.tableId}`
     : 'Awaiting project.dataset.table';
