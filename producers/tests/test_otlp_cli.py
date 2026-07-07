@@ -278,3 +278,281 @@ def test_bootstrap_rejects_bogus_source(capsys):
   rc = _run(["bootstrap", "--project", "p", "--source", "cursor"])
   assert rc == 2
   assert "source" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# verify subcommand (PR3)
+# --------------------------------------------------------------------------
+
+
+def _fake_results(*, fail=False, warn=False):
+  from bigquery_agent_analytics_tracing.otlp import verify
+
+  results = [verify.CheckResult("endpoint reachable", True, "200")]
+  if warn:
+    results.append(
+        verify.CheckResult("recent rows in otel_logs", False, "0", True)
+    )
+  if fail:
+    results.append(verify.CheckResult("tables and views exist", False, "gone"))
+  return results
+
+
+def test_verify_green_exits_zero(capsys, monkeypatch):
+  from bigquery_agent_analytics_tracing.otlp import verify
+
+  monkeypatch.setattr(
+      verify, "run_verify", lambda *a, **k: _fake_results(warn=True)
+  )
+  monkeypatch.setattr(verify, "make_query_rows", lambda project: lambda q: [])
+  rc = _run(
+      [
+          "verify",
+          "--endpoint",
+          "https://r",
+          "--token",
+          "tok",
+          "--project",
+          "p",
+          "--dataset",
+          "ds",
+      ]
+  )
+  assert rc == 0
+  out = capsys.readouterr().out
+  assert "OK" in out and "WARN" in out
+
+
+def test_verify_failure_exits_nonzero(capsys, monkeypatch):
+  from bigquery_agent_analytics_tracing.otlp import verify
+
+  monkeypatch.setattr(
+      verify, "run_verify", lambda *a, **k: _fake_results(fail=True)
+  )
+  monkeypatch.setattr(verify, "make_query_rows", lambda project: lambda q: [])
+  rc = _run(
+      [
+          "verify",
+          "--endpoint",
+          "https://r",
+          "--token",
+          "tok",
+          "--project",
+          "p",
+          "--dataset",
+          "ds",
+      ]
+  )
+  assert rc == 1
+  assert "FAIL" in capsys.readouterr().out
+
+
+def test_verify_smoke_flag_also_runs_smoke(monkeypatch):
+  from bigquery_agent_analytics_tracing.otlp import verify
+
+  called = {}
+  monkeypatch.setattr(verify, "run_verify", lambda *a, **k: _fake_results())
+  monkeypatch.setattr(
+      verify,
+      "run_smoke",
+      lambda *a, **k: called.setdefault("smoke", True) and _fake_results(),
+  )
+  monkeypatch.setattr(verify, "make_query_rows", lambda project: lambda q: [])
+  rc = _run(
+      [
+          "verify",
+          "--endpoint",
+          "https://r",
+          "--token",
+          "tok",
+          "--project",
+          "p",
+          "--dataset",
+          "ds",
+          "--smoke",
+      ]
+  )
+  assert rc == 0
+  assert called.get("smoke")
+
+
+def test_verify_token_falls_back_to_env(monkeypatch):
+  from bigquery_agent_analytics_tracing.otlp import verify
+
+  seen = {}
+
+  def _record(settings, **kw):
+    seen["token"] = settings.token
+    return _fake_results()
+
+  monkeypatch.setattr(verify, "run_verify", _record)
+  monkeypatch.setattr(verify, "make_query_rows", lambda project: lambda q: [])
+  monkeypatch.setenv("BQAA_OTLP_TOKEN", "env-tok")
+  rc = _run(
+      ["verify", "--endpoint", "https://r", "--project", "p", "--dataset", "ds"]
+  )
+  assert rc == 0
+  assert seen["token"] == "env-tok"
+
+
+# --------------------------------------------------------------------------
+# verify hardening (#332 full review)
+# --------------------------------------------------------------------------
+
+
+def test_verify_missing_token_exits_two(monkeypatch, capsys):
+  monkeypatch.delenv("BQAA_OTLP_TOKEN", raising=False)
+  rc = _run(
+      ["verify", "--endpoint", "https://r", "--project", "p", "--dataset", "d"]
+  )
+  assert rc == 2
+  assert "token" in capsys.readouterr().err.lower()
+
+
+def test_verify_rejects_plain_http_for_remote_hosts(monkeypatch, capsys):
+  monkeypatch.setenv("BQAA_OTLP_TOKEN", "tok")
+  rc = _run(
+      [
+          "verify",
+          "--endpoint",
+          "http://receiver.example.com",
+          "--project",
+          "p",
+          "--dataset",
+          "d",
+      ]
+  )
+  assert rc == 2
+  assert "https" in capsys.readouterr().err.lower()
+
+
+def test_verify_rejects_mixed_case_http_scheme(monkeypatch, capsys):
+  # URL schemes are case-insensitive: HTTP:// must not bypass the guard.
+  monkeypatch.setenv("BQAA_OTLP_TOKEN", "tok")
+  rc = _run(
+      [
+          "verify",
+          "--endpoint",
+          "HTTP://receiver.example.com",
+          "--project",
+          "p",
+          "--dataset",
+          "d",
+      ]
+  )
+  assert rc == 2
+  assert "https" in capsys.readouterr().err.lower()
+
+
+def test_verify_allows_http_for_localhost(monkeypatch):
+  from bigquery_agent_analytics_tracing.otlp import verify
+
+  monkeypatch.setenv("BQAA_OTLP_TOKEN", "tok")
+  monkeypatch.setattr(verify, "run_verify", lambda *a, **k: _fake_results())
+  monkeypatch.setattr(verify, "make_query_rows", lambda project: lambda q: [])
+  rc = _run(
+      [
+          "verify",
+          "--endpoint",
+          "http://127.0.0.1:9999",
+          "--project",
+          "p",
+          "--dataset",
+          "d",
+      ]
+  )
+  assert rc == 0
+
+
+def test_verify_invalid_signals_exit_two(monkeypatch, capsys):
+  monkeypatch.setenv("BQAA_OTLP_TOKEN", "tok")
+  rc = _run(
+      [
+          "verify",
+          "--endpoint",
+          "https://r",
+          "--project",
+          "p",
+          "--dataset",
+          "d",
+          "--signals",
+          "logs,metrics,trace",
+      ]
+  )
+  assert rc == 2
+  assert "signal" in capsys.readouterr().err.lower()
+
+
+def test_verify_plumbs_settings_and_timeout(monkeypatch):
+  from bigquery_agent_analytics_tracing.otlp import verify
+
+  monkeypatch.setenv("BQAA_OTLP_TOKEN", "tok")
+  seen = {}
+
+  def record_verify(settings, **kw):
+    seen["settings"] = settings
+    return _fake_results()
+
+  def record_smoke(settings, **kw):
+    seen["timeout_s"] = kw.get("timeout_s")
+    return _fake_results()
+
+  monkeypatch.setattr(verify, "run_verify", record_verify)
+  monkeypatch.setattr(verify, "run_smoke", record_smoke)
+  monkeypatch.setattr(verify, "make_query_rows", lambda project: lambda q: [])
+  rc = _run(
+      [
+          "verify",
+          "--endpoint",
+          "https://r",
+          "--project",
+          "p",
+          "--dataset",
+          "d",
+          "--signals",
+          "logs,metrics,traces",
+          "--recent-hours",
+          "6",
+          "--timeout",
+          "9",
+          "--smoke",
+      ]
+  )
+  assert rc == 0
+  assert seen["settings"].signals == ("logs", "metrics", "traces")
+  assert seen["settings"].recent_hours == 6
+  assert seen["timeout_s"] == 9
+
+
+def test_verify_rejects_schemeless_endpoint(monkeypatch, capsys):
+  monkeypatch.setenv("BQAA_OTLP_TOKEN", "tok")
+  rc = _run(
+      [
+          "verify",
+          "--endpoint",
+          "receiver.example.com",
+          "--project",
+          "p",
+          "--dataset",
+          "d",
+      ]
+  )
+  assert rc == 2
+  assert "http" in capsys.readouterr().err.lower()
+
+
+def test_verify_malformed_ipv6_endpoint_exits_cleanly(monkeypatch, capsys):
+  monkeypatch.setenv("BQAA_OTLP_TOKEN", "tok")
+  rc = _run(
+      [
+          "verify",
+          "--endpoint",
+          "http://[::1",
+          "--project",
+          "p",
+          "--dataset",
+          "d",
+      ]
+  )
+  assert rc == 2
+  assert "endpoint" in capsys.readouterr().err.lower()

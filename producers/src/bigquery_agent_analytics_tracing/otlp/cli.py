@@ -16,19 +16,22 @@
 
 ``config`` (PR 1) generates deployable telemetry-source artifacts from an
 already-deployed receiver's coordinates; ``bootstrap`` (PR 2) deploys the
-full pipeline (plan mode by default, ``--execute`` applies). ``verify`` /
-smoke (PR 3) lands next in the stack.
+full pipeline (plan mode by default, ``--execute`` applies); ``verify``
+(PR 3) checks a deployment read-only, or end-to-end with ``--smoke``.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 import subprocess
 import sys
+import urllib.parse
 
 from . import bootstrap as bootstrap_mod
 from . import config_artifacts
+from . import verify as verify_mod
 
 
 def _parse_kv(pairs: str) -> dict[str, str]:
@@ -199,6 +202,50 @@ def _build_parser() -> argparse.ArgumentParser:
       action="store_true",
       help="Apply the plan (default: print the commands and exit).",
   )
+
+  ver = sub.add_parser(
+      "verify",
+      help=(
+          "Check a deployment: endpoint reachability + auth enforcement,"
+          " table/view existence, recent rows, dead-letter health."
+          " --smoke additionally sends synthetic OTLP logs+metrics and"
+          " follows them into BigQuery and the projection."
+      ),
+  )
+  ver.add_argument("--endpoint", required=True, help="Receiver base URL.")
+  ver.add_argument(
+      "--token",
+      default=None,
+      help=(
+          "Bearer token. Prefer the BQAA_OTLP_TOKEN env var (the default):"
+          " a token on the command line is visible in shell history and"
+          " process listings."
+      ),
+  )
+  ver.add_argument("--project", required=True, help="GCP project id.")
+  ver.add_argument("--dataset", required=True, help="BigQuery dataset id.")
+  ver.add_argument(
+      "--signals",
+      default="logs,metrics",
+      help="Signal tier the deployment was bootstrapped with.",
+  )
+  ver.add_argument(
+      "--recent-hours",
+      type=int,
+      default=24,
+      help="Freshness window for recent-row / dead-letter checks.",
+  )
+  ver.add_argument(
+      "--smoke",
+      action="store_true",
+      help="Also exercise the write path with synthetic telemetry.",
+  )
+  ver.add_argument(
+      "--timeout",
+      type=float,
+      default=150,
+      help="Total seconds to wait for all smoke rows to land (one budget).",
+  )
   return parser
 
 
@@ -312,12 +359,100 @@ def _cmd_bootstrap(args: argparse.Namespace) -> int:
   return 0
 
 
+def _cmd_verify(args: argparse.Namespace) -> int:
+  token = args.token or os.environ.get("BQAA_OTLP_TOKEN", "")
+  if not token:
+    print(
+        "bqaa-otel: error: no bearer token — pass --token or set"
+        " BQAA_OTLP_TOKEN",
+        file=sys.stderr,
+    )
+    return 2
+  # The bearer token rides on every request: plain http to a remote host
+  # would send it cleartext. Loopback stays allowed for local harnesses.
+  # Schemes are case-insensitive (HTTP:// must not bypass the guard), and
+  # urlsplit itself raises on malformed bracketed IPv6 ('http://[::1').
+  try:
+    split = urllib.parse.urlsplit(args.endpoint)
+    host = split.hostname or ""
+  except ValueError as exc:
+    print(
+        f"bqaa-otel: error: --endpoint {args.endpoint!r} is not a valid"
+        f" URL ({exc}) — expected e.g. https://<receiver>.run.app",
+        file=sys.stderr,
+    )
+    return 2
+  scheme = split.scheme.lower()
+  if scheme not in ("http", "https"):
+    print(
+        f"bqaa-otel: error: --endpoint {args.endpoint!r} is not an http(s)"
+        " URL — expected e.g. https://<receiver>.run.app",
+        file=sys.stderr,
+    )
+    return 2
+  if scheme == "http" and host not in (
+      "localhost",
+      "127.0.0.1",
+      "::1",
+  ):
+    print(
+        "bqaa-otel: error: refusing to send the bearer token over plain"
+        f" http to {host!r} — use an https endpoint (http is allowed for"
+        " localhost only).",
+        file=sys.stderr,
+    )
+    return 2
+  try:
+    settings = verify_mod.VerifySettings(
+        endpoint=args.endpoint,
+        token=token,
+        project=args.project,
+        dataset=args.dataset,
+        signals=tuple(s for s in args.signals.split(",") if s),
+        recent_hours=args.recent_hours,
+    )
+  except ValueError as exc:
+    return _report_settings_error(exc)
+  query_rows = verify_mod.make_query_rows(args.project)
+  results = verify_mod.run_verify(
+      settings,
+      http_post=verify_mod.default_http_post,
+      query_rows=query_rows,
+  )
+  if args.smoke:
+    results += verify_mod.run_smoke(
+        settings,
+        http_post=verify_mod.default_http_post,
+        query_rows=query_rows,
+        timeout_s=args.timeout,
+    )
+
+  failures = 0
+  for r in results:
+    if r.ok:
+      status = "OK  "
+    elif r.warning:
+      status = "WARN"
+    else:
+      status = "FAIL"
+      failures += 1
+    print(f"{status}  {r.name}: {r.detail}")
+  print()
+  if failures:
+    print(f"{failures} check(s) failed.")
+    return 1
+  print("All checks passed.")
+  return 0
+
+
 def main(argv: list[str] | None = None) -> int:
   args = _build_parser().parse_args(argv)
   if args.command == "config":
     return _cmd_config(args)
   if args.command == "bootstrap":
     return _cmd_bootstrap(args)
+  if args.command == "verify":
+    return _cmd_verify(args)
   raise AssertionError(f"unhandled command {args.command!r}")
 
 
