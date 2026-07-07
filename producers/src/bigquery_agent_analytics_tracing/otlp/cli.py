@@ -14,17 +14,20 @@
 
 """``bqaa-otel`` — enterprise admin CLI for OTel -> BigQuery (issue #324).
 
-PR 1 ships ``config`` (generate deployable telemetry-source artifacts from
-an already-deployed receiver's coordinates). ``bootstrap`` (infra
-orchestration, PR 2) and ``verify`` / smoke (PR 3) land next in the stack.
+``config`` (PR 1) generates deployable telemetry-source artifacts from an
+already-deployed receiver's coordinates; ``bootstrap`` (PR 2) deploys the
+full pipeline (plan mode by default, ``--execute`` applies). ``verify`` /
+smoke (PR 3) lands next in the stack.
 """
 
 from __future__ import annotations
 
 import argparse
 import pathlib
+import subprocess
 import sys
 
+from . import bootstrap as bootstrap_mod
 from . import config_artifacts
 
 
@@ -117,7 +120,99 @@ def _build_parser() -> argparse.ArgumentParser:
       default=pathlib.Path("."),
       help="Directory to write artifacts into (default: current directory).",
   )
+
+  boot = sub.add_parser(
+      "bootstrap",
+      help=(
+          "Deploy the full OTel->BigQuery pipeline: schema + views, Pub/Sub"
+          " + DLQ, bearer-token secret, Cloud Run receiver + consumer,"
+          " scheduled MERGE, and telemetry-source config artifacts. Default"
+          " is plan mode; pass --execute to apply."
+      ),
+  )
+  boot.add_argument("--project", required=True, help="GCP project id.")
+  boot.add_argument(
+      "--dataset", default="agent_analytics", help="BigQuery dataset id."
+  )
+  boot.add_argument(
+      "--region",
+      default="us-central1",
+      help="Cloud Run / Artifact Registry region.",
+  )
+  boot.add_argument(
+      "--bq-location", default="US", help="BigQuery dataset location."
+  )
+  boot.add_argument(
+      "--source",
+      default="claude-code",
+      help=(
+          "Comma-separated telemetry sources:"
+          f" {','.join(config_artifacts.SOURCES)}"
+      ),
+  )
+  boot.add_argument(
+      "--signals",
+      default="logs,metrics",
+      help="Signal tier: 'logs,metrics' (default) or 'logs,metrics,traces'.",
+  )
+  boot.add_argument(
+      "--privacy",
+      default="baseline",
+      choices=config_artifacts.PRIVACY_TIERS,
+      help=(
+          "Privacy tier. 'baseline' (default) captures no prompt/tool"
+          " content; 'replay' requires --i-understand-content-logging."
+      ),
+  )
+  boot.add_argument(
+      "--source-product",
+      default="claude_code",
+      help=(
+          "source_product stamped on ingested rows by the receiver"
+          " (BQAA_OTLP_SOURCE_PRODUCT)."
+      ),
+  )
+  boot.add_argument(
+      "--resource-attributes",
+      type=_parse_kv,
+      default=None,
+      metavar="K=V[,K=V...]",
+      help="OTEL_RESOURCE_ATTRIBUTES to stamp, e.g. department=engineering.",
+  )
+  boot.add_argument(
+      "--i-understand-content-logging",
+      action="store_true",
+      dest="ack_content_logging",
+      help=(
+          "Required with --privacy replay: acknowledges prompt text (which"
+          " can contain full conversation history) will be exported."
+      ),
+  )
+  boot.add_argument(
+      "--out",
+      type=pathlib.Path,
+      default=pathlib.Path("."),
+      help="Directory to write config artifacts into after the deploy.",
+  )
+  boot.add_argument(
+      "--execute",
+      action="store_true",
+      help="Apply the plan (default: print the commands and exit).",
+  )
   return parser
+
+
+def _report_settings_error(exc: ValueError) -> int:
+  """Print a tier/settings ValueError (shared by config and bootstrap)."""
+  print(f"bqaa-otel: error: {exc}", file=sys.stderr)
+  if "acknowledge_content_logging" in str(exc):
+    print(
+        "bqaa-otel: --privacy replay exports prompt text; pass"
+        " --i-understand-content-logging only if that is acceptable"
+        " in your environment.",
+        file=sys.stderr,
+    )
+  return 2
 
 
 def _cmd_config(args: argparse.Namespace) -> int:
@@ -134,15 +229,7 @@ def _cmd_config(args: argparse.Namespace) -> int:
         spec, sources=tuple(s for s in args.source.split(",") if s)
     )
   except ValueError as exc:
-    print(f"bqaa-otel: error: {exc}", file=sys.stderr)
-    if "acknowledge_content_logging" in str(exc):
-      print(
-          "bqaa-otel: --privacy replay exports prompt text; pass"
-          " --i-understand-content-logging only if that is acceptable"
-          " in your environment.",
-          file=sys.stderr,
-      )
-    return 2
+    return _report_settings_error(exc)
 
   if spec.privacy == "replay":
     print(
@@ -175,10 +262,62 @@ def _cmd_config(args: argparse.Namespace) -> int:
   return 0
 
 
+def _cmd_bootstrap(args: argparse.Namespace) -> int:
+  try:
+    settings = bootstrap_mod.BootstrapSettings(
+        project=args.project,
+        dataset=args.dataset,
+        region=args.region,
+        bq_location=args.bq_location,
+        signals=tuple(s for s in args.signals.split(",") if s),
+        privacy=args.privacy,
+        sources=tuple(s for s in args.source.split(",") if s),
+        source_product=args.source_product,
+        resource_attributes=args.resource_attributes,
+        acknowledge_content_logging=args.ack_content_logging,
+        out_dir=args.out,
+    )
+  except ValueError as exc:
+    return _report_settings_error(exc)
+
+  if not args.execute:
+    print(bootstrap_mod.render_plan(settings))
+    return 0
+
+  # The Cloud Build step uploads the *current directory* as the build
+  # context; refuse to mutate anything unless we are at the repo root.
+  if not pathlib.Path("deploy/otlp_receiver/Dockerfile").is_file():
+    print(
+        "bqaa-otel: error: deploy/otlp_receiver/Dockerfile not found —"
+        " run --execute from the repository root (the Cloud Build step"
+        " uploads the current directory as the build context).",
+        file=sys.stderr,
+    )
+    return 2
+
+  try:
+    bootstrap_mod.run_bootstrap(settings, bootstrap_mod.SubprocessRunner())
+  except subprocess.CalledProcessError as exc:
+    cmd = exc.cmd if isinstance(exc.cmd, str) else " ".join(exc.cmd)
+    print(f"bqaa-otel: deploy step failed: {cmd}", file=sys.stderr)
+    for stream in (exc.stderr, exc.stdout):
+      if stream and stream.strip():
+        print(stream.strip(), file=sys.stderr)
+    print(
+        "bqaa-otel: fix the underlying error and re-run — every step is"
+        " idempotent/convergent, so a re-run resumes safely.",
+        file=sys.stderr,
+    )
+    return 1
+  return 0
+
+
 def main(argv: list[str] | None = None) -> int:
   args = _build_parser().parse_args(argv)
   if args.command == "config":
     return _cmd_config(args)
+  if args.command == "bootstrap":
+    return _cmd_bootstrap(args)
   raise AssertionError(f"unhandled command {args.command!r}")
 
 
