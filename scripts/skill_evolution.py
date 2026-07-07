@@ -59,21 +59,27 @@ You are an Error Analyst in a skill evolution system. You examine a single
 FAILED agent trajectory to identify what went wrong and propose a specific,
 GENERALIZABLE improvement to the agent's skill document.
 
-You receive the current skill document and a failed trajectory (which may be
-multi-turn and may include an execution trace of tool calls and routing).
+You receive the current skill document, the list of TOOLS the agent has, and a
+failed trajectory (which may be multi-turn and may include an execution trace of
+tool calls and routing).
 
 Analysis process:
 1. Read the trajectory. If a [CORRECTION] turn is present, extract BOTH what the
    agent claimed (the wrong fact) AND what the user corrected it to (the right
    fact) -- that is direct evidence of a skill gap.
-2. If an execution trace is present, use it as ground truth: did the agent skip a
-   tool call (HALLUCINATION), call the wrong tool (KEYWORD_GAP), ignore a tool
-   result (MISSING_RULE), get routed wrong (SCOPE_GAP), or merely echo the user's
-   correction without re-verifying via a tool (PARROTING)?
-3. Identify the ROOT CAUSE -- why the skill document did not prevent this -- and
-   categorize it: KEYWORD_GAP, MISSING_RULE, AMBIGUITY, SCOPE_GAP, HALLUCINATION,
+2. Check the TOOLS. If the agent deflected, declined, or said it lacked the
+   information (e.g. "contact HR") on a topic one of its tools can answer, the
+   root cause is TOOL_USAGE: it failed to use a tool it already has. The fix is a
+   rule to CALL THE TOOL first -- never to bake the missing fact into the skill.
+3. If an execution trace is present, use it as ground truth: did the agent skip a
+   tool call (TOOL_USAGE), call the wrong tool (WRONG_TOOL), ignore a tool
+   result (MISSING_RULE), get routed wrong (SCOPE_GAP), invent a fact
+   (HALLUCINATION), or echo the user's correction without re-verifying via a tool
+   (PARROTING)?
+4. Identify the ROOT CAUSE -- why the skill did not prevent this -- and categorize
+   it: TOOL_USAGE, WRONG_TOOL, MISSING_RULE, AMBIGUITY, SCOPE_GAP, HALLUCINATION,
    PARROTING, or CORRECTION_IGNORE.
-4. Propose a concrete patch that generalizes beyond this one question.
+5. Propose a concrete, BEHAVIORAL patch that generalizes beyond this one question.
 
 Output format (use exactly this structure):
 
@@ -81,19 +87,21 @@ Output format (use exactly this structure):
 [CATEGORY]: [one-line description]
 
 ## Analysis
-[2-3 sentences. Cite the specific wrong claim + user correction, or specific tool
-calls (or their absence), as evidence.]
+[2-3 sentences citing the evidence: the wrong claim + user correction, or the
+missing/wrong tool call.]
 
 ## Proposed Patch
 Section: [which section of the skill to modify or create]
-Action: add_rule | add_mapping | add_edge_case | add_anti_pattern
+Action: add_rule | add_edge_case | add_anti_pattern
 Content:
-[The exact text to add. Must generalize beyond this single trajectory.]
+[The exact text to add. A behavioral rule, not a fact. Must generalize.]
 
 RULES:
-- Patches must GENERALIZE; be specific and actionable, not vague.
-- User corrections are FACTUAL EVIDENCE -- use them to write precise rules.
-- If the failure has no generalizable fix, output "NO_PATCH: [reason]".
+- Patches must GENERALIZE and be BEHAVIORAL (how to act), never baked facts.
+- A missing fact that a tool could fetch is a TOOL_USAGE fix (a rule to call the
+  tool), NOT a reason to return NO_PATCH.
+- Only output "NO_PATCH: [reason]" if there is genuinely no behavioral fix and no
+  tool could have helped (e.g. a truly out-of-scope request).
 """
 
 SUCCESS_ANALYST_PROMPT = """\
@@ -110,8 +118,10 @@ user's correction without re-querying a tool (a [~] parroted segment), output
 
 Analysis process:
 1. Identify what the agent did RIGHT that is NOT already explicit in the skill.
-2. Focus on transferable patterns: KEYWORD_MAPPING, RESPONSE_PATTERN,
-   DISAMBIGUATION, TOOL_USAGE, or CORRECTION_RECOVERY.
+2. Focus on transferable patterns: RESPONSE_PATTERN, DISAMBIGUATION,
+   TOOL_USAGE, or CORRECTION_RECOVERY. Do NOT propose keyword or synonym
+   mappings -- the lookup tool resolves the user's wording itself, so a synonym
+   table in the skill is redundant.
 
 Output format (use exactly this structure):
 
@@ -123,7 +133,7 @@ Output format (use exactly this structure):
 
 ## Proposed Patch
 Section: [which section of the skill to modify or create]
-Action: reinforce_pattern | add_mapping | add_example
+Action: reinforce_pattern | add_rule | add_example
 Content:
 [The exact text to add. Must generalize beyond this one question.]
 
@@ -143,8 +153,11 @@ preserves capability identity).
 Merge rules (follow ALL):
 1. Preserve identity: keep the same name, purpose, and overall structure.
 2. Never drop existing content. Every section, rule, and table row in the BASE
-   MUST appear in your output unless a patch explicitly corrects it (then update
-   that rule in place). Dropping an existing section is a failure.
+   MUST appear in your output unless a patch corrects it (then update it in
+   place). Exception: if the BASE tells the agent to refuse, decline, or deflect
+   (e.g. "contact HR") on a topic its tools CAN answer, that is the defect to
+   fix -- rewrite it into a tool-first rule. Overriding such a deflection is
+   required, not a failure.
 3. Semantic union, not concatenation: integrate each patch into the right section.
 4. Prevalence: insights from many independent analysts are systematic -- integrate
    confidently; 1-2 analyst one-offs only if clearly general.
@@ -152,20 +165,30 @@ Merge rules (follow ALL):
 6. Import only reusable, non-conflicting additions; strip case-specific entities
    and analyst scratch notes ("NO_PATCH", "Root Cause:").
 7. Do not invent figures or policies absent from the base or a patch.
-8. A skill is BEHAVIORAL: do NOT bake specific data values (numbers, dates,
-   dollar amounts, limits) into it -- those must come from tools at runtime, and
-   copies go stale or wrong. Keep rules and tool-usage guidance; never paste
-   tool-result facts pulled from a trajectory. (Preserve any data already in the
-   base verbatim, but add no new specific values.)
+8. A skill is BEHAVIORAL, not a knowledge base. Do NOT add facts of any kind --
+   not numbers/dates/limits, and not qualitative facts ("PTO is paid out on
+   resignation", "a doctor's note is required"). The skill says HOW to behave;
+   the TOOL supplies WHAT. Never paste tool-result facts from a trajectory into
+   the skill. Preserve facts already in the base verbatim, but add no new ones --
+   if the agent needs a fact, the rule is "look it up".
 9. On conflict, keep the better-evidenced patch.
+10. Do NOT add a Keyword Mapping or Terminology Mapping section. The lookup tool
+   resolves the user's own wording itself; capture behavior as rules, never as
+   synonym tables.
+11. Be tool-first: the merged skill must tell the agent to use its tools for any
+   in-scope question BEFORE answering, and to say it lacks the information only
+   after a tool search comes up empty -- never to deflect to HR first.
+12. Generalize, do not enumerate: prefer ONE rule ("look up any company-policy
+   question with your tools") over a long list of specific topics. Collapse
+   per-topic lists from the patches into that general rule.
 
 Output the COMPLETE merged SKILL.md (frontmatter + full body):
 - YAML frontmatter between --- delimiters: keep name/description; set
   metadata.version = base version + 1 ("0"->"1"); metadata.author =
   skill-evolution; metadata.evolved_from = base version.
-- The full body = every base section (verbatim or refined in place) plus new
-  sections motivated by patches (e.g. Keyword Mappings, Edge Cases, Anti-Patterns,
-  Out-of-Scope Handling).
+- The full body = every base section (refined in place) plus new sections
+  motivated by patches (e.g. Tool Usage, Anti-Patterns, Response Rules). Do NOT
+  add a Keyword/Terminology Mapping section.
 
 Self-check before output: does every "## " heading from the base still appear? If
 not, add it back.
@@ -176,8 +199,8 @@ You are a Skill Compactor. Distill an evolved skill that grew too large to under
 {max_chars} characters while preserving effectiveness.
 
 Keep all mandatory tool-use rules and anti-hallucination directives verbatim.
-Merge redundant rules (keep the most specific), compress obvious keyword mappings,
-remove filler, and preserve section headings and numbered lists.
+Merge redundant rules (keep the most specific), drop baked facts the tool can
+supply, remove filler, and preserve section headings and numbered lists.
 
 Output the COMPLETE compacted SKILL.md including YAML frontmatter. Keep the same
 version number and metadata.
@@ -229,6 +252,32 @@ def _format_conversation(conversation) -> str:
   return "\n".join(parts)
 
 
+def _format_tool_calls(session: dict) -> str:
+  """Render the actual tool calls (name + args) for the analyst.
+
+  This makes *tool selection* visible -- e.g. a deflection that never called a
+  tool, versus one that called the wrong tool -- so the analyst can propose a
+  ``TOOL_USAGE`` / ``WRONG_TOOL`` rule from observed behavior, not just the
+  judge's grounding flag. Sessions scored before this field existed carry no
+  ``tool_calls_detail`` key and render nothing (backward compatible).
+  """
+  if "tool_calls_detail" not in session:
+    return ""
+  detail = session.get("tool_calls_detail") or []
+  if not detail:
+    # Empty detail but a nonzero count means calls happened yet weren't captured
+    # (e.g. a BigQuery-path session) -- say nothing rather than a false "(none)".
+    if session.get("tool_calls"):
+      return ""
+    return "Tool calls: (none)\n"
+  lines = ["Tool calls:"]
+  for call in detail:
+    name = call.get("name", "?") or "?"
+    args = call.get("args", {}) or {}
+    lines.append(f"  - {name}({json.dumps(args, sort_keys=True)})")
+  return "\n".join(lines) + "\n"
+
+
 def format_trajectory(session: dict) -> str:
   """Format a session for analyst consumption (single- or multi-turn)."""
   metrics = session.get("metrics", {})
@@ -243,6 +292,7 @@ def format_trajectory(session: dict) -> str:
     result += f"Verdict: {usefulness.get('category', '')}\n"
     result += f"Justification: {usefulness.get('justification', '')}\n"
     result += f"Grounding: {grounding.get('category', '')}\n"
+    result += _format_tool_calls(session)
     if session.get("corrections"):
       result += f"User corrections: {session['corrections']}\n"
     for dim in (
@@ -282,8 +332,9 @@ def format_trajectory(session: dict) -> str:
       f"Agent: {session.get('answered_by', '')}\n"
       f"Verdict: {usefulness.get('category', '')}\n"
       f"Justification: {usefulness.get('justification', '')}\n"
-      f"Grounding: {grounding.get('category', '')}"
-  )
+      f"Grounding: {grounding.get('category', '')}\n"
+      f"{_format_tool_calls(session)}"
+  ).rstrip("\n")
 
 
 # ---------------------------------------------------------------------------
@@ -292,14 +343,13 @@ def format_trajectory(session: dict) -> str:
 
 ROOT_CAUSE_CATEGORIES = frozenset(
     {
-        "KEYWORD_GAP",
+        "WRONG_TOOL",
         "MISSING_RULE",
         "AMBIGUITY",
         "SCOPE_GAP",
         "HALLUCINATION",
         "PARROTING",
         "CORRECTION_IGNORE",
-        "KEYWORD_MAPPING",
         "RESPONSE_PATTERN",
         "DISAMBIGUATION",
         "TOOL_USAGE",
@@ -308,13 +358,19 @@ ROOT_CAUSE_CATEGORIES = frozenset(
 )
 
 
-def run_analyst(client, model, system_prompt, session, current_skill):
+def run_analyst(
+    client, model, system_prompt, session, current_skill, tools=None
+):
   """Run one analyst on one trajectory. Returns patch text or None."""
   from google.genai import types
 
   trajectory = format_trajectory(session)
+  tools_block = (
+      f"<available_tools>\n{tools}\n</available_tools>\n\n" if tools else ""
+  )
   prompt = (
       f"<current_skill>\n{current_skill}\n</current_skill>\n\n"
+      f"{tools_block}"
       f"<trajectory>\n{trajectory}\n</trajectory>\n\n"
       "Analyze this trajectory and propose your patch."
   )
@@ -348,12 +404,27 @@ def passes_quality_gate(patch: str) -> bool:
 
 
 def strip_code_fences(text: str) -> str:
-  """Strip a wrapping markdown code fence if the model added one."""
+  """Strip a wrapping markdown code fence if the model added one.
+
+  Handles two shapes:
+  1. A fence wrapping the whole response (```markdown\\n...\\n```).
+  2. An orphan opening fence the model inserts right after YAML frontmatter
+     (``---\\n...\\n---\\n```\\n<body>``). The matching close is usually lost, so
+     the unbalanced fence would otherwise render verbatim in the deployed skill.
+  """
   if text.startswith("```"):
     lines = text.split("\n")
     lines = lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
     stripped = "\n".join(lines).strip()
     return stripped or text
+  # Orphan fence right after a YAML frontmatter block, with no matching close.
+  match = re.match(r"(---\n.*?\n---\n)(.*)", text, re.DOTALL)
+  if match:
+    body = match.group(2)
+    if body.count("```") % 2 == 1:
+      new_body = re.sub(r"^\n*```[^\n]*\n", "", body, count=1)
+      if new_body != body:
+        return match.group(1) + new_body
   return text
 
 
@@ -389,6 +460,79 @@ def compute_prevalence_summary(patches: list[str]) -> str:
         f"  {cat}: {count}/{total} ({round(count / total * 100)}%) -- {strength}"
     )
   return "\n".join(lines)
+
+
+def _write_evolution_artifacts(
+    artifacts_dir,
+    patches,
+    candidates,
+    selected,
+    current_skill,
+    version_label="v1",
+    selection_note=None,
+):
+  """Persist the engine's intermediate reasoning for inspection/audit.
+
+  When ``evolve_skill`` is given ``artifacts_dir`` it writes, under that dir
+  (``<label>`` is ``version_label``, so a V1->V2 round writes ``v2_*``):
+    - ``<label>_patches.json``  -- every analyst patch (root-cause category + text)
+    - ``<label>_candidates/``   -- each best-of-N consolidation candidate (the
+                                   chosen one tagged ``_SELECTED``)
+    - ``<label>_prevalence.txt``-- root-cause category tally across the patches
+    - ``<label>_selection.txt`` -- one-line record of WHY this outcome (which
+                                   candidate won, or why the incumbent was kept)
+  """
+  os.makedirs(artifacts_dir, exist_ok=True)
+
+  records = []
+  for i, patch in enumerate(patches):
+    match = re.search(r"## Root Cause\s*\n\s*\[?(\w+)\]?", patch) or re.search(
+        r"## Pattern\s*\n\s*\[?(\w+)\]?", patch
+    )
+    records.append(
+        {
+            "index": i + 1,
+            "category": match.group(1) if match else None,
+            "patch": patch,
+        }
+    )
+  patches_path = os.path.join(artifacts_dir, f"{version_label}_patches.json")
+  with open(patches_path, "w") as f:
+    json.dump(records, f, indent=2)
+    f.write("\n")
+
+  cand_dir = os.path.join(artifacts_dir, f"{version_label}_candidates")
+  os.makedirs(cand_dir, exist_ok=True)
+  kept = [c for c in candidates if c and c != current_skill]
+  for i, cand in enumerate(kept):
+    tag = "_SELECTED" if cand == selected else ""
+    path = os.path.join(cand_dir, f"candidate_{i + 1}{tag}.md")
+    with open(path, "w") as f:
+      f.write(cand if cand.endswith("\n") else cand + "\n")
+
+  prevalence = compute_prevalence_summary(patches)
+  if prevalence:
+    prevalence_path = os.path.join(
+        artifacts_dir, f"{version_label}_prevalence.txt"
+    )
+    with open(prevalence_path, "w") as f:
+      f.write(prevalence + "\n")
+
+  # Audit trail of the selection outcome -- especially the incumbent guard
+  # firing ("kept incumbent: ..."), which otherwise leaves no artifact at all.
+  if selection_note:
+    selection_path = os.path.join(
+        artifacts_dir, f"{version_label}_selection.txt"
+    )
+    with open(selection_path, "w") as f:
+      f.write(selection_note + "\n")
+
+  logger.info(
+      "Wrote evolution artifacts to %s (%d patches, %d candidates).",
+      artifacts_dir,
+      len(records),
+      len(kept),
+  )
 
 
 def validate_evolved_skill(evolved: str, current_skill: str) -> list[str]:
@@ -532,6 +676,7 @@ def collect_patches(
     max_workers=10,
     max_success_samples=15,
     analyst_mode="both",
+    tools=None,
 ):
   """Run the analyst fleet over the report. Returns the list of kept patches."""
   successes, failures = partition_trajectories(report)
@@ -549,12 +694,24 @@ def collect_patches(
     futures = {}
     for s in failures:
       fut = executor.submit(
-          run_analyst, client, model, ERROR_ANALYST_PROMPT, s, current_skill
+          run_analyst,
+          client,
+          model,
+          ERROR_ANALYST_PROMPT,
+          s,
+          current_skill,
+          tools,
       )
       futures[fut] = ("error", (s.get("question", "") or "")[:60])
     for s in successes:
       fut = executor.submit(
-          run_analyst, client, model, SUCCESS_ANALYST_PROMPT, s, current_skill
+          run_analyst,
+          client,
+          model,
+          SUCCESS_ANALYST_PROMPT,
+          s,
+          current_skill,
+          tools,
       )
       futures[fut] = ("success", (s.get("question", "") or "")[:60])
     for fut in as_completed(futures):
@@ -650,6 +807,9 @@ def evolve_skill(
     analyst_mode: str = "both",
     score_fn: Optional[Callable[[str], float]] = None,
     min_improvement: float = 0.5,
+    tools: Optional[str] = None,
+    artifacts_dir: Optional[str] = None,
+    version_label: str = "v1",
     client=None,
 ) -> str:
   """Evolve a SKILL.md from a scored quality report.
@@ -669,6 +829,12 @@ def evolve_skill(
       median-size viable candidate is returned (avoids truncated runts/bloat).
     min_improvement: A candidate must beat the incumbent score by at least this
       margin (in score_fn units) to be selected; otherwise the base is kept.
+    artifacts_dir: If set, write the analyst patches, the best-of-N candidates,
+      a prevalence summary, and a one-line selection record here (for
+      inspection/audit) before returning.
+    version_label: Prefix for the artifact filenames (default ``"v1"``). Pass
+      the round being PRODUCED -- e.g. ``"v2"`` for a V1->V2 run -- so
+      successive rounds don't overwrite each other's artifacts.
     client: Optional pre-built google-genai Client (else one is created).
 
   Returns:
@@ -689,6 +855,7 @@ def evolve_skill(
       max_workers=max_workers,
       max_success_samples=max_success_samples,
       analyst_mode=analyst_mode,
+      tools=tools,
   )
   if not patches:
     logger.warning("No patches to consolidate; returning the current skill.")
@@ -725,7 +892,42 @@ def evolve_skill(
     c = sanitize_adk_vars(c)
     if not validate_evolved_skill(c, current_skill):
       viable.append(c)
-  return select_candidate(viable, current_skill, score_fn, min_improvement)
+  selected = select_candidate(viable, current_skill, score_fn, min_improvement)
+  if artifacts_dir:
+    # Reconstruct WHY this outcome, so the incumbent guard leaves an audit
+    # trail (selection.txt) instead of firing silently.
+    if selected == current_skill:
+      if not viable:
+        selection_note = (
+            "kept incumbent: no viable candidate passed the structural"
+            " guardrails"
+        )
+      else:
+        selection_note = (
+            f"kept incumbent: none of the {len(viable)} viable candidate(s)"
+            f" beat the incumbent score by the {min_improvement} margin"
+        )
+    else:
+      picked = viable.index(selected) + 1
+      selection_note = (
+          f"selected candidate {picked} of {len(viable)} viable"
+          f" ({len(selected)} chars,"
+          f" {'scored best' if score_fn else 'median size'})"
+      )
+    # Write the *sanitized* viable candidates (the same pool `selected` came
+    # from), so the `_SELECTED` tag attaches correctly and the saved candidate
+    # is byte-for-byte the returned skill -- raw `cands` could differ after
+    # sanitize_adk_vars().
+    _write_evolution_artifacts(
+        artifacts_dir,
+        patches,
+        viable,
+        selected,
+        current_skill,
+        version_label=version_label,
+        selection_note=selection_note,
+    )
+  return selected
 
 
 # ---------------------------------------------------------------------------
@@ -757,7 +959,36 @@ def _main():
       default="both",
       choices=["both", "error-only", "success-only"],
   )
+  ap.add_argument(
+      "--tools",
+      default=None,
+      help=(
+          "Freeform description of the agent's tools, shown to the analysts so"
+          " they can propose 'use the tool' rules instead of NO_PATCH on"
+          " deflections. Overridden by --eval-spec's `tools` field if both given."
+      ),
+  )
+  ap.add_argument(
+      "--eval-spec",
+      default=None,
+      help="eval_spec.json to read the `tools` field from (see --tools)",
+  )
+  ap.add_argument(
+      "--artifacts-dir",
+      default=None,
+      help=(
+          "Directory to write analyst patches, best-of-N candidates, the"
+          " prevalence tally, and the selection record into (for audit)"
+      ),
+  )
   args = ap.parse_args()
+
+  tools = args.tools
+  if args.eval_spec:
+    if not os.path.exists(args.eval_spec):
+      ap.error(f"--eval-spec not found: {args.eval_spec}")
+    with open(args.eval_spec) as f:
+      tools = (json.load(f) or {}).get("tools") or tools
 
   logging.basicConfig(
       level=logging.INFO,
@@ -766,6 +997,17 @@ def _main():
   )
   for noisy in ("google.genai", "google_genai", "httpx", "httpcore"):
     logging.getLogger(noisy).setLevel(logging.ERROR)
+
+  if args.eval_spec and not tools:
+    # Library CLI stays lenient (runs without tool awareness) but warns; the
+    # lab wrapper (analyze_and_evolve.py) fail-fasts on the same condition.
+    # Emitted after basicConfig: a module-level logging call before it would
+    # install an implicit WARNING-level root handler and mute every INFO log.
+    logging.warning(
+        "--eval-spec %s has no `tools` field; analysts will run WITHOUT tool"
+        " awareness.",
+        args.eval_spec,
+    )
 
   with open(args.skill) as f:
     current_skill = f.read()
@@ -778,6 +1020,8 @@ def _main():
       candidates=args.candidates,
       max_chars=args.max_chars,
       analyst_mode=args.analyst_mode,
+      tools=tools,
+      artifacts_dir=args.artifacts_dir,
   )
   with open(args.output, "w") as f:
     f.write(evolved)

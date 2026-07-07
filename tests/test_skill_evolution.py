@@ -19,12 +19,14 @@ consolidation guardrails, and fence/var sanitization. They do not make any
 network calls (the google-genai import is lazy, inside the API functions).
 """
 
+import json
 import os
 import sys
 
 # Make scripts/ importable.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 from skill_evolution import _has_parroted_recovery  # noqa: E402
+from skill_evolution import _write_evolution_artifacts
 from skill_evolution import compute_prevalence_summary
 from skill_evolution import format_trajectory
 from skill_evolution import partition_trajectories
@@ -135,6 +137,47 @@ def test_format_renders_subtrajectory_outcomes():
   assert "[~]" in out  # parroted icon
 
 
+def test_format_renders_tool_calls_single_turn():
+  # A deflection that named the wrong tool must be visible to the analyst so it
+  # can propose a TOOL_USAGE/WRONG_TOOL rule from observed behavior.
+  s = _session(
+      "unhelpful",
+      question="what's my STD payout?",
+      response="contact HR",
+      tool_calls_detail=[
+          {"name": "lookup_company_policy", "args": {"topic": "std"}}
+      ],
+  )
+  out = format_trajectory(s)
+  assert "Tool calls:" in out
+  assert "lookup_company_policy" in out
+  assert "std" in out
+
+
+def test_format_renders_no_tool_calls_when_empty():
+  s = _session("unhelpful", question="q", response="r", tool_calls_detail=[])
+  assert "Tool calls: (none)" in format_trajectory(s)
+
+
+def test_format_omits_tool_calls_for_legacy_sessions():
+  # Sessions scored before tool_calls_detail existed carry no such key.
+  s = _session("unhelpful", question="q", response="r")
+  assert "Tool calls" not in format_trajectory(s)
+
+
+def test_format_says_nothing_when_calls_happened_but_detail_missing():
+  # BQ-path: tool_calls counted from trace spans, no structured detail. Must NOT
+  # render a false "(none)" -- say nothing instead.
+  s = _session(
+      "unhelpful",
+      question="q",
+      response="r",
+      tool_calls_detail=[],
+      tool_calls=3,
+  )
+  assert "Tool calls" not in format_trajectory(s)
+
+
 # --- passes_quality_gate ----------------------------------------------------
 
 
@@ -170,6 +213,20 @@ def test_strip_code_fences_noop_without_fence():
 
 def test_strip_code_fences_keeps_original_if_empty():
   assert strip_code_fences("```\n```") == "```\n```"
+
+
+def test_strip_code_fences_removes_orphan_fence_after_frontmatter():
+  text = '---\nname: x\nmetadata:\n  version: "1"\n---\n```\n\nBody line.\n'
+  assert (
+      strip_code_fences(text)
+      == '---\nname: x\nmetadata:\n  version: "1"\n---\n\nBody line.\n'
+  )
+
+
+def test_strip_code_fences_keeps_balanced_fence_after_frontmatter():
+  # A real, balanced code block in the body must be preserved.
+  text = "---\nname: x\n---\nBody.\n\n```bash\nrun it\n```\n"
+  assert strip_code_fences(text) == text
 
 
 # --- sanitize_adk_vars ------------------------------------------------------
@@ -271,3 +328,63 @@ def test_select_candidate_picks_better_when_it_clears_margin():
       ["cand1", "cand2"], "BASE", score_fn=scores.get, min_improvement=0.5
   )
   assert out == "cand1"
+
+
+# --- _write_evolution_artifacts --------------------------------------------
+
+
+def test_write_evolution_artifacts(tmp_path):
+  patches = [
+      "## Root Cause\nTOOL_USAGE: deflected instead of calling the tool.\n",
+      "## Root Cause\nTOOL_USAGE: same again.\n",
+      "## Pattern\nRESPONSE_PATTERN: bridged the term.\n",
+  ]
+  base = "BASE SKILL"
+  candidates = ["CAND ONE", "CAND TWO", base, ""]  # base + empty are dropped
+  selected = "CAND TWO"
+
+  out = str(tmp_path)
+  _write_evolution_artifacts(out, patches, candidates, selected, base)
+
+  # Patches: one record per patch, with parsed category.
+  records = json.load(open(os.path.join(out, "v1_patches.json")))
+  assert len(records) == 3
+  assert records[0]["category"] == "TOOL_USAGE"
+  assert records[2]["category"] == "RESPONSE_PATTERN"
+  assert records[0]["patch"] == patches[0]
+
+  # Candidates: base/empty filtered; selected one tagged.
+  cand_dir = os.path.join(out, "v1_candidates")
+  files = sorted(os.listdir(cand_dir))
+  assert files == ["candidate_1.md", "candidate_2_SELECTED.md"]
+  assert (
+      open(os.path.join(cand_dir, "candidate_2_SELECTED.md")).read().strip()
+      == "CAND TWO"
+  )
+
+  # Prevalence summary written.
+  prevalence = open(os.path.join(out, "v1_prevalence.txt")).read()
+  assert "TOOL_USAGE: 2/3" in prevalence
+
+
+def test_write_evolution_artifacts_version_label_and_selection(tmp_path):
+  # A V1->V2 round writes v2_* names (no clobbering of the v1_* artifacts),
+  # and the selection note is persisted as the audit trail of the outcome.
+  patches = ["## Root Cause\nTOOL_USAGE: x.\n"]
+  base = "BASE SKILL"
+
+  out = str(tmp_path)
+  _write_evolution_artifacts(
+      out,
+      patches,
+      [base],  # every candidate == base -> incumbent kept, no candidate files
+      base,
+      base,
+      version_label="v2",
+      selection_note="kept incumbent: no viable candidate passed guardrails",
+  )
+
+  assert os.path.exists(os.path.join(out, "v2_patches.json"))
+  assert os.listdir(os.path.join(out, "v2_candidates")) == []
+  note = open(os.path.join(out, "v2_selection.txt")).read()
+  assert note.startswith("kept incumbent:")

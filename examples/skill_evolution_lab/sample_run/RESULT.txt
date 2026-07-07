@@ -28,3 +28,4 @@ Parroted sub-trajectories: V0=11  V1=0 (lower is better -- the agent re-verified
 | Specificity | 0.95 | 2.00 | +1.05 |
 | Scope compliance | 0.85 | 2.00 | +1.15 |
 | First-time-right | 0.85 | 1.99 | +1.14 |
+
